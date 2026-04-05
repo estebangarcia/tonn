@@ -6,7 +6,7 @@ pub use alacritty_terminal::grid::{Dimensions, Grid};
 pub use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 pub use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 pub use alacritty_terminal::term::cell::{Cell, Flags as CellFlags};
-pub use alacritty_terminal::term::{Config as TermConfig, Term};
+pub use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 pub use alacritty_terminal::vte::ansi;
 pub use ansi::StdSyncHandler;
 

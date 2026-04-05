@@ -1,7 +1,9 @@
 pub mod error;
+pub mod output;
 pub mod types;
 
 pub use error::{NexError, Result};
+pub use output::{CompressedOutput, OutputClass};
 pub use types::*;
 
 /// Cell geometry constants shared across rendering, layout, and input.

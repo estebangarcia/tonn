@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use nex_common::{BlockId, PaneId};
+use nex_common::{BlockId, CompressedOutput, OutputClass, PaneId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +29,7 @@ pub struct Block {
 
     // AI fields
     pub classification: OutputClass,
+    pub token_estimate: usize,
 }
 
 /// Multi-tier output representation.
@@ -36,47 +37,6 @@ pub struct Block {
 pub struct BlockOutput {
     pub stripped_text: String,
     pub compressed: CompressedOutput,
-}
-
-/// Compressed output for token savings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompressedOutput {
-    pub summary: String,
-    pub key_lines: Vec<String>,
-    pub compression_ratio: f32,
-}
-
-impl Default for CompressedOutput {
-    fn default() -> Self {
-        Self {
-            summary: String::new(),
-            key_lines: Vec::new(),
-            compression_ratio: 0.0,
-        }
-    }
-}
-
-/// Output classification for domain-specific compression.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum OutputClass {
-    GitDiff,
-    GitLog,
-    GitStatus,
-    TestResult,
-    CompileOutput,
-    LogOutput,
-    LsDirectory,
-    JsonOutput,
-    ErrorMessage,
-    Interactive,
-    Plain,
-    Unknown,
-}
-
-impl Default for OutputClass {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 /// Thread-safe block store.
@@ -139,10 +99,13 @@ use nex_ipc::BlockEvent;
 use std::collections::HashMap;
 use std::time::Instant;
 
+const TOKEN_ESTIMATE_DIVISOR: usize = 4;
+
 /// Per-pane state machine that assembles a Block from BlockEvents.
 struct BlockBuilder {
     pane_id: PaneId,
     state: BuilderState,
+    command: String,
     output_bytes: Vec<u8>,
     start_time: Option<Instant>,
     cwd: PathBuf,
@@ -161,6 +124,7 @@ impl BlockBuilder {
         Self {
             pane_id,
             state: BuilderState::Idle,
+            command: String::new(),
             output_bytes: Vec::new(),
             start_time: None,
             cwd: PathBuf::new(),
@@ -173,13 +137,15 @@ impl BlockBuilder {
             BlockEvent::PromptStart { .. } => {
                 self.state = BuilderState::PromptActive;
                 self.output_bytes.clear();
+                self.command.clear();
                 None
             }
             BlockEvent::CommandStart { .. } => {
                 self.state = BuilderState::CommandInput;
                 None
             }
-            BlockEvent::ExecutionStart { .. } => {
+            BlockEvent::ExecutionStart { command, .. } => {
+                self.command = command;
                 self.start_time = Some(Instant::now());
                 self.state = BuilderState::Executing;
                 self.output_bytes.clear();
@@ -196,21 +162,26 @@ impl BlockBuilder {
                 let raw_output = String::from_utf8_lossy(&self.output_bytes);
                 let stripped = nex_token_save::strip_ansi(&raw_output);
 
+                let classification = nex_token_save::classify(&self.command, &stripped);
+                let compressed = nex_token_save::compress(&classification, &self.command, &stripped);
+                let token_estimate = stripped.len() / TOKEN_ESTIMATE_DIVISOR;
+
                 let block = Block {
                     id: BlockId::new(),
                     pane_id: self.pane_id,
                     sequence: store.next_sequence(),
                     prompt: String::new(),
-                    command: String::new(), // TODO: capture from CommandInput state
+                    command: std::mem::take(&mut self.command),
                     output: BlockOutput {
                         stripped_text: stripped,
-                        compressed: CompressedOutput::default(),
+                        compressed,
                     },
                     exit_code: Some(exit_code),
                     cwd: self.cwd.clone(),
                     duration,
                     timestamp: Utc::now(),
-                    classification: OutputClass::Unknown,
+                    classification,
+                    token_estimate,
                 };
 
                 self.state = BuilderState::Idle;
@@ -248,9 +219,12 @@ pub fn block_processor_thread(rx: Receiver<BlockEvent>, store: Arc<BlockStore>) 
         if let Some(block) = builder.process(event, &store) {
             tracing::info!(
                 pane_id = %block.pane_id,
+                command = %block.command,
                 exit_code = ?block.exit_code,
                 duration = ?block.duration,
-                output_len = block.output.stripped_text.len(),
+                classification = ?block.classification,
+                token_estimate = block.token_estimate,
+                compression_ratio = block.output.compressed.compression_ratio,
                 "Block sealed"
             );
             store.insert(block);
