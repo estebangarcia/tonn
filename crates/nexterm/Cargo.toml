@@ -30,7 +30,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 pollster = { workspace = true }
+arboard = { workspace = true }
 nex-token-save = { workspace = true }
+alacritty_terminal = { workspace = true }
 
 [features]
 default = ["plugin-claude-code"]
