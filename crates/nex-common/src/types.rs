@@ -61,6 +61,28 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+/// Unique identifier for a tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TabId(pub Uuid);
+
+impl TabId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for TabId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for TabId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Unique identifier for a mux session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MuxSessionId(pub Uuid);
@@ -90,11 +112,14 @@ pub struct TerminalSize {
     pub cols: u16,
 }
 
+pub const DEFAULT_TERM_ROWS: u16 = 24;
+pub const DEFAULT_TERM_COLS: u16 = 80;
+
 impl Default for TerminalSize {
     fn default() -> Self {
         Self {
-            rows: 24,
-            cols: 80,
+            rows: DEFAULT_TERM_ROWS,
+            cols: DEFAULT_TERM_COLS,
         }
     }
 }

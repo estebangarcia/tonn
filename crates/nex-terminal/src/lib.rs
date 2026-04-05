@@ -298,7 +298,7 @@ pub fn read_grid_content<T: EventListener>(term: &Term<T>) -> GridContent {
     }
 
     let cursor_point = grid.cursor.point;
-    let cursor_row = (cursor_point.line.0 + display_offset as i32) as usize;
+    let cursor_row = (cursor_point.line.0 + display_offset as i32).max(0) as usize;
     let cursor_col = cursor_point.column.0;
 
     let selection = term.selection.as_ref().and_then(|s| s.to_range(term));

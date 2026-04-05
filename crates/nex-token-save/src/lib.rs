@@ -27,7 +27,14 @@ pub fn strip_ansi(input: &str) -> String {
                         // OSC sequence: ESC ] ... ST
                         chars.next();
                         while let Some(c) = chars.next() {
-                            if c == '\x07' || c == '\x1b' {
+                            if c == '\x07' {
+                                break;
+                            }
+                            if c == '\x1b' {
+                                // Consume the \ of ST (ESC \)
+                                if chars.peek() == Some(&'\\') {
+                                    chars.next();
+                                }
                                 break;
                             }
                         }
@@ -65,5 +72,16 @@ mod tests {
     #[test]
     fn test_strip_ansi_csi() {
         assert_eq!(strip_ansi("\x1b[1;32mbold green\x1b[0m"), "bold green");
+    }
+
+    #[test]
+    fn test_strip_ansi_osc_st_terminator() {
+        // OSC terminated by ESC \ should not leak the backslash
+        assert_eq!(strip_ansi("\x1b]0;title\x1b\\hello"), "hello");
+    }
+
+    #[test]
+    fn test_strip_ansi_osc_bel_terminator() {
+        assert_eq!(strip_ansi("\x1b]0;title\x07hello"), "hello");
     }
 }

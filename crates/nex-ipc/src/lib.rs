@@ -1,18 +1,5 @@
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use nex_common::PaneId;
-
-/// Events sent from the I/O thread to the main/UI thread.
-#[derive(Debug)]
-pub enum IoEvent {
-    /// Terminal output changed, needs redraw.
-    Redraw(PaneId),
-    /// PTY process exited.
-    ProcessExited { pane_id: PaneId, exit_code: i32 },
-    /// Terminal title changed.
-    TitleChanged { pane_id: PaneId, title: String },
-    /// Bell character received.
-    Bell(PaneId),
-}
 
 /// Events sent from the I/O thread to the block processor.
 #[derive(Debug)]
@@ -41,11 +28,6 @@ pub enum BlockEvent {
         pane_id: PaneId,
         cwd: std::path::PathBuf,
     },
-}
-
-/// Create a bounded channel pair for I/O events.
-pub fn io_channel(capacity: usize) -> (Sender<IoEvent>, Receiver<IoEvent>) {
-    bounded(capacity)
 }
 
 /// Create an unbounded channel pair for block events.

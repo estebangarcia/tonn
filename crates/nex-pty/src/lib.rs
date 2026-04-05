@@ -3,6 +3,45 @@
 use nex_common::{NexError, Result, TerminalSize};
 use portable_pty::{CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
 use std::io::{Read, Write};
+use std::path::PathBuf;
+
+// Shell integration scripts embedded at compile time.
+const SHELL_INTEGRATION_ZSH: &str = include_str!("../../../shell/nexterm.zsh");
+const SHELL_INTEGRATION_BASH: &str = include_str!("../../../shell/nexterm.bash");
+const SHELL_INTEGRATION_FISH: &str = include_str!("../../../shell/nexterm.fish");
+
+/// Write embedded shell integration scripts to a runtime directory.
+/// Returns the directory path. Prefers a user-local data directory to avoid
+/// writing to a predictable world-writable /tmp path.
+fn ensure_shell_integration_dir() -> Result<PathBuf> {
+    let dir = dirs::data_local_dir()
+        .map(|d| d.join("nexterm"))
+        .unwrap_or_else(|| std::env::temp_dir().join("nexterm-shell-integration"));
+    std::fs::create_dir_all(&dir)?;
+
+    std::fs::write(dir.join("nexterm.zsh"), SHELL_INTEGRATION_ZSH)?;
+    std::fs::write(dir.join("nexterm.bash"), SHELL_INTEGRATION_BASH)?;
+    std::fs::write(dir.join("nexterm.fish"), SHELL_INTEGRATION_FISH)?;
+
+    Ok(dir)
+}
+
+/// Detect the shell type from the shell path.
+fn shell_type(shell: &str) -> &'static str {
+    let name = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if name.contains("zsh") {
+        "zsh"
+    } else if name.contains("bash") {
+        "bash"
+    } else if name.contains("fish") {
+        "fish"
+    } else {
+        "unknown"
+    }
+}
 
 /// A managed PTY instance.
 pub struct NexPty {
@@ -12,6 +51,7 @@ pub struct NexPty {
 
 impl NexPty {
     /// Spawn a new PTY with the given shell command.
+    /// Automatically injects shell integration for supported shells.
     pub fn spawn(shell: &str, size: TerminalSize) -> Result<(Self, Box<dyn Read + Send>, Box<dyn Write + Send>)> {
         let pty_system = native_pty_system();
 
@@ -29,6 +69,70 @@ impl NexPty {
         let mut cmd = CommandBuilder::new(shell);
         cmd.env("TERM", "xterm-256color");
         cmd.env("NEXTERM", "1");
+
+        // Auto-inject shell integration
+        if let Ok(integration_dir) = ensure_shell_integration_dir() {
+            let script_path = integration_dir.display().to_string();
+            match shell_type(shell) {
+                "zsh" => {
+                    // ZDOTDIR trick: we create a .zshrc that sources the user's original
+                    // .zshrc then sources our integration. This is the same approach
+                    // VS Code and iTerm2 use.
+                    let zdotdir = integration_dir.join("zsh");
+                    std::fs::create_dir_all(&zdotdir).ok();
+
+                    let user_zdotdir = std::env::var("ZDOTDIR")
+                        .unwrap_or_else(|_| {
+                            dirs::home_dir()
+                                .unwrap_or_else(|| PathBuf::from("/"))
+                                .display()
+                                .to_string()
+                        });
+
+                    // .zshenv: keep ZDOTDIR as wrapper dir (so zsh finds our .zshrc),
+                    // but source user's .zshenv from their home.
+                    let zshenv = format!(
+                        r#"NEXTERM_USER_ZDOTDIR="{user_zdotdir}"
+[[ -f "{user_zdotdir}/.zshenv" ]] && ZDOTDIR="{user_zdotdir}" source "{user_zdotdir}/.zshenv"
+"#
+                    );
+                    std::fs::write(zdotdir.join(".zshenv"), zshenv).ok();
+
+                    // .zshrc: source user's .zshrc (with ZDOTDIR temporarily restored
+                    // so plugins like Powerlevel10k see the right value), then permanently
+                    // restore ZDOTDIR and source our integration.
+                    let zshrc = format!(
+                        r#"ZDOTDIR="{user_zdotdir}"
+[[ -f "{user_zdotdir}/.zshrc" ]] && source "{user_zdotdir}/.zshrc"
+source "{script_path}/nexterm.zsh"
+"#
+                    );
+                    std::fs::write(zdotdir.join(".zshrc"), zshrc).ok();
+                    cmd.env("ZDOTDIR", zdotdir.display().to_string());
+                    cmd.env("NEXTERM_USER_ZDOTDIR", &user_zdotdir);
+                }
+                "bash" => {
+                    // Bash: use --rcfile or ENV to source our integration after .bashrc
+                    let rcfile = integration_dir.join("bash_init.sh");
+                    let wrapper = format!(
+                        r#"# Nexterm auto-injected wrapper
+if [[ -f ~/.bashrc ]]; then
+    source ~/.bashrc
+fi
+source "{script_path}/nexterm.bash"
+"#
+                    );
+                    std::fs::write(&rcfile, wrapper).ok();
+                    cmd.args(["--rcfile", &rcfile.display().to_string()]);
+                }
+                "fish" => {
+                    // Fish: use --init-command
+                    let init = format!("source {script_path}/nexterm.fish");
+                    cmd.args(["--init-command", &init]);
+                }
+                _ => {}
+            }
+        }
 
         slave
             .spawn_command(cmd)

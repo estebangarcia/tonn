@@ -36,14 +36,21 @@ _nexterm_prompt_command() {
     _nexterm_osc133 "A"
 }
 
-# PS0 runs before command execution (Bash 4.4+)
-_nexterm_ps0() {
+# Pre-exec via DEBUG trap (avoids subshell so _nexterm_executing persists)
+_nexterm_preexec() {
+    if [[ -n "$COMP_LINE" ]]; then
+        return
+    fi
+    # Avoid firing during prompt rendering itself
+    if [[ "$BASH_COMMAND" == "_nexterm_prompt_command" ]]; then
+        return
+    fi
     _nexterm_executing=1
     _nexterm_osc133 "C"
 }
+trap '_nexterm_preexec' DEBUG
 
 # Install
 PROMPT_COMMAND="_nexterm_prompt_command${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
-PS0='$(_nexterm_ps0)'
 # Append command input marker after PS1
 PS1="$PS1\[$(_nexterm_osc133 B)\]"

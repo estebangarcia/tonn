@@ -4,7 +4,7 @@
 
 # Only activate inside Nexterm
 if not set -q NEXTERM
-    exit
+    return
 end
 
 function _nexterm_osc133
