@@ -23,8 +23,10 @@ use winit::window::{Window, WindowId};
 /// Custom events sent to the winit event loop from background threads.
 #[derive(Debug, Clone)]
 enum UserEvent {
-    /// The shell process exited.
     PtyExited,
+    Title(String),
+    ResetTitle,
+    Bell,
 }
 
 use nex_common::PaneId;
@@ -60,6 +62,7 @@ struct App {
     modifiers: Modifiers,
     mouse_pos: (f64, f64),
     mouse_selecting: bool,
+    bell_flash_until: Option<std::time::Instant>,
 }
 
 impl App {
@@ -76,6 +79,7 @@ impl App {
             modifiers: Modifiers::default(),
             mouse_pos: (0.0, 0.0),
             mouse_selecting: false,
+            bell_flash_until: None,
         }
     }
 
@@ -127,7 +131,22 @@ impl App {
                     ..Default::default()
                 };
                 let term_size = TermSize::new(cols as usize, rows as usize);
-                let event_listener = NexEventListener::new(PaneId::new(), pty_write_tx);
+                let proxy_for_listener = self.event_proxy.clone();
+                let event_callback: nex_terminal::EventCallback = Box::new(move |event| {
+                    match event {
+                        nex_terminal::TerminalEvent::Title(title) => {
+                            let _ = proxy_for_listener.send_event(UserEvent::Title(title));
+                        }
+                        nex_terminal::TerminalEvent::ResetTitle => {
+                            let _ = proxy_for_listener.send_event(UserEvent::ResetTitle);
+                        }
+                        nex_terminal::TerminalEvent::Bell => {
+                            let _ = proxy_for_listener.send_event(UserEvent::Bell);
+                        }
+                        _ => {}
+                    }
+                });
+                let event_listener = NexEventListener::new(PaneId::new(), pty_write_tx, event_callback);
                 let term = Term::new(term_config, &term_size, event_listener);
                 let terminal = Arc::new(Mutex::new(term));
                 self.terminal = Some(Arc::clone(&terminal));
@@ -170,6 +189,23 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::PtyExited => {
                 tracing::info!("Shell exited, closing terminal");
                 event_loop.exit();
+            }
+            UserEvent::Title(title) => {
+                if let Some(window) = &self.window {
+                    window.set_title(&title);
+                }
+            }
+            UserEvent::ResetTitle => {
+                if let Some(window) = &self.window {
+                    window.set_title("Nexterm");
+                }
+            }
+            UserEvent::Bell => {
+                self.bell_flash_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
         }
     }
@@ -519,9 +555,24 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     drop(term);
 
+                    let bell_active = self
+                        .bell_flash_until
+                        .map(|t| std::time::Instant::now() < t)
+                        .unwrap_or(false);
+                    if !bell_active {
+                        self.bell_flash_until = None;
+                    }
+
                     renderer.set_content(&render_spans);
-                    if let Err(e) = renderer.render(content.cursor_row, content.cursor_col, &bg_cells, &selection_cells) {
+                    if let Err(e) = renderer.render(content.cursor_row, content.cursor_col, &bg_cells, &selection_cells, bell_active) {
                         tracing::error!("Render error: {e}");
+                    }
+
+                    // Schedule another redraw to clear the bell flash
+                    if bell_active {
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
                     }
                 }
             }

@@ -372,6 +372,7 @@ impl Renderer {
         cursor_col: usize,
         bg_cells: &[BgCell],
         selection_cells: &[SelectionCell],
+        bell_active: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&TextureViewDescriptor::default());
@@ -439,11 +440,15 @@ impl Renderer {
                     view: &view,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color {
-                            r: BG_R as f64 / 255.0,
-                            g: BG_G as f64 / 255.0,
-                            b: BG_B as f64 / 255.0,
-                            a: 1.0,
+                        load: LoadOp::Clear(if bell_active {
+                            wgpu::Color { r: 0.15, g: 0.15, b: 0.18, a: 1.0 }
+                        } else {
+                            wgpu::Color {
+                                r: BG_R as f64 / 255.0,
+                                g: BG_G as f64 / 255.0,
+                                b: BG_B as f64 / 255.0,
+                                a: 1.0,
+                            }
                         }),
                         store: StoreOp::Store,
                     },

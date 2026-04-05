@@ -13,15 +13,23 @@ pub use ansi::StdSyncHandler;
 use nex_common::PaneId;
 use std::sync::mpsc;
 
-/// Event listener that captures terminal events and forwards PtyWrite requests.
+/// Callback for terminal events that need to reach the main event loop.
+pub type EventCallback = Box<dyn Fn(TerminalEvent) + Send + Sync>;
+
+/// Event listener that forwards terminal events.
 pub struct NexEventListener {
     pub pane_id: PaneId,
     pub pty_write_tx: mpsc::Sender<String>,
+    pub event_callback: EventCallback,
 }
 
 impl NexEventListener {
-    pub fn new(pane_id: PaneId, pty_write_tx: mpsc::Sender<String>) -> Self {
-        Self { pane_id, pty_write_tx }
+    pub fn new(
+        pane_id: PaneId,
+        pty_write_tx: mpsc::Sender<String>,
+        event_callback: EventCallback,
+    ) -> Self {
+        Self { pane_id, pty_write_tx, event_callback }
     }
 }
 
@@ -30,6 +38,11 @@ impl EventListener for NexEventListener {
         match &event {
             TerminalEvent::PtyWrite(text) => {
                 let _ = self.pty_write_tx.send(text.clone());
+            }
+            TerminalEvent::Title(_)
+            | TerminalEvent::ResetTitle
+            | TerminalEvent::Bell => {
+                (self.event_callback)(event);
             }
             _ => {
                 tracing::trace!(?event, pane_id = %self.pane_id, "terminal event");
