@@ -1,0 +1,12 @@
+[package]
+name = "nex-token-save"
+description = "Token-saving output compression pipeline for Nexterm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nex-common = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "nex-plugin"
+description = "Plugin system for Nexterm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nex-common = { workspace = true }
+nex-block = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

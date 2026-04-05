@@ -1,0 +1,17 @@
+[package]
+name = "nex-mux"
+description = "Built-in terminal multiplexer for Nexterm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nex-common = { workspace = true }
+nex-pty = { workspace = true }
+nex-terminal = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+crossbeam-channel = { workspace = true }

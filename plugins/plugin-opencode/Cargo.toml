@@ -1,0 +1,10 @@
+[package]
+name = "plugin-opencode"
+description = "opencode integration plugin for Nexterm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nex-common = { workspace = true }
+nex-plugin = { workspace = true }

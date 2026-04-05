@@ -1,0 +1,39 @@
+[package]
+name = "nexterm"
+description = "AI-first terminal emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nexterm"
+path = "src/main.rs"
+
+[dependencies]
+nex-common = { workspace = true }
+nex-config = { workspace = true }
+nex-terminal = { workspace = true }
+nex-pty = { workspace = true }
+nex-mux = { workspace = true }
+nex-block = { workspace = true }
+nex-render = { workspace = true }
+nex-ipc = { workspace = true }
+nex-shell-integration = { workspace = true }
+
+tokio = { workspace = true }
+winit = { workspace = true }
+wgpu = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+pollster = { workspace = true }
+nex-token-save = { workspace = true }
+
+[features]
+default = ["plugin-claude-code"]
+plugin-claude-code = []
+plugin-opencode = []
+plugin-gemini-cli = []

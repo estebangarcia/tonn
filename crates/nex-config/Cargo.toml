@@ -1,0 +1,14 @@
+[package]
+name = "nex-config"
+description = "Configuration management for Nexterm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nex-common = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

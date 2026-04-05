@@ -1,0 +1,24 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Models (downloaded on first run)
+models/*.gguf
+
+# Config (user-specific)
+config.toml
+
+# Environment
+.env
+.env.local

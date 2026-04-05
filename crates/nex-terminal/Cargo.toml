@@ -1,0 +1,13 @@
+[package]
+name = "nex-terminal"
+description = "VT terminal emulation for Nexterm (wraps alacritty_terminal)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nex-common = { workspace = true }
+alacritty_terminal = { workspace = true }
+vte = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }

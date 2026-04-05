@@ -1,0 +1,117 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nexterm",
+    "crates/nex-terminal",
+    "crates/nex-pty",
+    "crates/nex-mux",
+    "crates/nex-block",
+    "crates/nex-render",
+    "crates/nex-mcp",
+    "crates/nex-ai-session",
+    "crates/nex-autocomplete",
+    "crates/nex-token-save",
+    "crates/nex-shell-integration",
+    "crates/nex-plugin",
+    "crates/nex-config",
+    "crates/nex-ipc",
+    "crates/nex-common",
+    "plugins/plugin-claude-code",
+    "plugins/plugin-opencode",
+    "plugins/plugin-gemini-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/nexterm/nexterm"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates
+nex-common = { path = "crates/nex-common" }
+nex-config = { path = "crates/nex-config" }
+nex-terminal = { path = "crates/nex-terminal" }
+nex-pty = { path = "crates/nex-pty" }
+nex-mux = { path = "crates/nex-mux" }
+nex-block = { path = "crates/nex-block" }
+nex-render = { path = "crates/nex-render" }
+nex-mcp = { path = "crates/nex-mcp" }
+nex-ai-session = { path = "crates/nex-ai-session" }
+nex-autocomplete = { path = "crates/nex-autocomplete" }
+nex-token-save = { path = "crates/nex-token-save" }
+nex-shell-integration = { path = "crates/nex-shell-integration" }
+nex-plugin = { path = "crates/nex-plugin" }
+nex-ipc = { path = "crates/nex-ipc" }
+
+# Terminal emulation
+alacritty_terminal = "0.25"
+vte = "0.15"
+
+# PTY
+portable-pty = "0.9"
+
+# GPU rendering
+wgpu = "28"
+winit = "0.30"
+
+# Text rendering
+cosmic-text = "0.15"
+glyphon = "0.10"
+
+# Font discovery
+font-kit = "0.14"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Concurrency
+crossbeam-channel = "0.5"
+dashmap = "6"
+parking_lot = "0.12"
+
+# File watching
+notify = "7"
+
+# HTTP
+axum = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async blocking
+pollster = "0.4"
+
+# Directory paths
+dirs = "6"
+
+[profile.release]
+lto = "thin"
+opt-level = 3
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
