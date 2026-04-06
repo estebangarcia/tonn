@@ -104,6 +104,163 @@ struct TabSwitcher {
     selected_index: usize,
 }
 
+struct SessionBrowser {
+    trees: Vec<nex_ai_session::SessionTree>,
+    nexterm_active_ids: Vec<String>,  // session IDs running in Nexterm panes
+    display_entries: Vec<DisplayEntry>,
+    selected_index: usize,
+    filter: String,
+    active_only: bool,
+    expanded_projects: std::collections::HashSet<String>,
+}
+
+struct DisplayEntry {
+    kind: DisplayEntryKind,
+}
+
+enum DisplayEntryKind {
+    ProjectHeader { name: String, count: usize, expanded: bool },
+    Session { flat_entry: nex_ai_session::FlatSessionEntry },
+}
+
+impl SessionBrowser {
+    fn new(trees: Vec<nex_ai_session::SessionTree>, nexterm_active_ids: Vec<String>) -> Self {
+        let expanded_projects: std::collections::HashSet<String> =
+            trees.iter().map(|t| t.project_name.clone()).collect();
+        let mut browser = Self {
+            trees,
+            nexterm_active_ids,
+            display_entries: Vec::new(),
+            selected_index: 0,
+            filter: String::new(),
+            active_only: false,
+            expanded_projects,
+        };
+        browser.rebuild_display();
+        browser
+    }
+
+    fn rebuild_display(&mut self) {
+        self.display_entries.clear();
+        let query = self.filter.to_lowercase();
+
+        for tree in &self.trees {
+            let mut flat: Vec<nex_ai_session::FlatSessionEntry> = Vec::new();
+            for (i, root) in tree.roots.iter().enumerate() {
+                root.flatten(0, i == tree.roots.len() - 1, &mut flat);
+            }
+
+            let filtered_flat: Vec<nex_ai_session::FlatSessionEntry> = flat
+                .into_iter()
+                .filter(|f| {
+                    if self.active_only && !self.is_active_in_nexterm(&f.session.id) {
+                        return false;
+                    }
+                    if query.is_empty() {
+                        return true;
+                    }
+                    f.session.project_name.to_lowercase().contains(&query)
+                        || f.session.summary.to_lowercase().contains(&query)
+                        || f.session.id.to_lowercase().contains(&query)
+                })
+                .collect();
+
+            if filtered_flat.is_empty() {
+                continue;
+            }
+
+            let total_count = filtered_flat.len();
+            let expanded = self.expanded_projects.contains(&tree.project_name);
+
+            self.display_entries.push(DisplayEntry {
+                kind: DisplayEntryKind::ProjectHeader {
+                    name: tree.project_name.clone(),
+                    count: total_count,
+                    expanded,
+                },
+            });
+
+            if expanded {
+                for flat_entry in filtered_flat {
+                    self.display_entries.push(DisplayEntry {
+                        kind: DisplayEntryKind::Session { flat_entry },
+                    });
+                }
+            }
+        }
+
+        if self.selected_index >= self.display_entries.len() {
+            self.selected_index = self.display_entries.len().saturating_sub(1);
+        }
+    }
+
+    fn apply_filter(&mut self) {
+        self.rebuild_display();
+    }
+
+    fn toggle_active_only(&mut self) {
+        self.active_only = !self.active_only;
+        self.rebuild_display();
+    }
+
+    fn toggle_expand(&mut self) {
+        if let Some(entry) = self.display_entries.get(self.selected_index) {
+            if let DisplayEntryKind::ProjectHeader { name, .. } = &entry.kind {
+                let name = name.clone();
+                if self.expanded_projects.contains(&name) {
+                    self.expanded_projects.remove(&name);
+                } else {
+                    self.expanded_projects.insert(name);
+                }
+                self.rebuild_display();
+            }
+        }
+    }
+
+    fn expand_at_selection(&mut self) {
+        if let Some(entry) = self.display_entries.get(self.selected_index) {
+            if let DisplayEntryKind::ProjectHeader { name, expanded, .. } = &entry.kind {
+                if !expanded {
+                    self.expanded_projects.insert(name.clone());
+                    self.rebuild_display();
+                }
+            }
+        }
+    }
+
+    fn collapse_at_selection(&mut self) {
+        if let Some(entry) = self.display_entries.get(self.selected_index) {
+            if let DisplayEntryKind::ProjectHeader { name, expanded, .. } = &entry.kind {
+                if *expanded {
+                    self.expanded_projects.remove(name);
+                    self.rebuild_display();
+                }
+            }
+        }
+    }
+
+    fn is_header_selected(&self) -> bool {
+        self.display_entries
+            .get(self.selected_index)
+            .map(|e| matches!(e.kind, DisplayEntryKind::ProjectHeader { .. }))
+            .unwrap_or(false)
+    }
+
+    fn selected_session(&self) -> Option<&nex_ai_session::AiSession> {
+        self.display_entries.get(self.selected_index).and_then(|entry| {
+            if let DisplayEntryKind::Session { flat_entry } = &entry.kind {
+                Some(&flat_entry.session)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn is_active_in_nexterm(&self, session_id: &str) -> bool {
+        self.nexterm_active_ids.iter().any(|id| id == session_id)
+    }
+}
+
 struct App {
     shell: String,
     proxy: WinitProxy,
@@ -115,12 +272,14 @@ struct App {
     mouse_selecting: bool,
     bell_flash_until: Option<std::time::Instant>,
     tab_switcher: Option<TabSwitcher>,
+    session_browser: Option<SessionBrowser>,
+    session_manager: Option<Arc<nex_ai_session::SessionManager>>,
     last_tab_count: usize,
     last_active_tab: usize,
     terminal_state: Option<Arc<parking_lot::Mutex<nex_mcp::TerminalStateSnapshot>>>,
     block_store: Option<Arc<nex_block::BlockStore>>,
-    /// Pending resize: we debounce rapid resize events and only apply the final one.
     pending_resize: Option<(u32, u32, std::time::Instant)>,
+    window_focused: bool,
 }
 
 impl App {
@@ -136,11 +295,14 @@ impl App {
             mouse_selecting: false,
             bell_flash_until: None,
             tab_switcher: None,
+            session_browser: None,
+            session_manager: None,
             last_tab_count: 1,
             last_active_tab: 0,
             terminal_state: None,
             block_store: None,
             pending_resize: None,
+            window_focused: true,
         }
     }
 
@@ -248,8 +410,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Redraw => {
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+                // Only request redraw when focused — avoids queuing hundreds
+                // of redraws while unfocused (e.g., during Claude Code streaming)
+                if self.window_focused {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                 }
             }
             UserEvent::McpExecute(cmd) => {
@@ -355,6 +521,23 @@ impl ApplicationHandler<UserEvent> for App {
                 tracing::info!("Mux initialized with 1 tab, 1 pane");
                 self.mux = Some(mux);
 
+                // Initialize session manager
+                let session_manager = Arc::new(nex_ai_session::SessionManager::new());
+                session_manager.scan();
+                tracing::info!("Scanned {} Claude Code sessions", session_manager.count());
+                self.session_manager = Some(Arc::clone(&session_manager));
+
+                // Start session file watcher in background
+                let watcher_manager = Arc::clone(&session_manager);
+                std::thread::Builder::new()
+                    .name("session-watcher".into())
+                    .spawn(move || {
+                        if let Err(e) = watcher_manager.start_watcher() {
+                            tracing::warn!("Session file watcher failed: {e}");
+                        }
+                    })
+                    .ok();
+
                 // Store block_store for MCP state updates
                 self.block_store = Some(Arc::clone(&block_store));
 
@@ -387,6 +570,7 @@ impl ApplicationHandler<UserEvent> for App {
                     Arc::clone(&block_store),
                     Arc::clone(&terminal_state),
                     execute_tx,
+                    Arc::clone(&session_manager),
                 );
 
                 // Spawn MCP HTTP server on the pre-allocated port
@@ -577,9 +761,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.render_frame();
             }
 
-            WindowEvent::Focused(true) => {
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+            WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
+                if focused {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                 }
             }
 
@@ -613,6 +800,117 @@ impl App {
         let ctrl = self.modifiers.state().control_key();
         let super_key = self.modifiers.state().super_key();
         let shift = self.modifiers.state().shift_key();
+
+        // --- Session browser (Cmd+Shift+P) ---
+        if super_key && shift && matches!(logical_key, Key::Character(c) if c.as_str() == "p" || c.as_str() == "P") {
+            if self.session_browser.is_some() {
+                self.session_browser = None;
+            } else if let Some(mgr) = &self.session_manager {
+                let trees = mgr.session_trees();
+                let active_ids: Vec<String> = self.mux.as_ref()
+                    .map(|m| {
+                        trees.iter()
+                            .flat_map(|t| {
+                                let mut flat = Vec::new();
+                                for (i, root) in t.roots.iter().enumerate() {
+                                    root.flatten(0, i == t.roots.len() - 1, &mut flat);
+                                }
+                                flat.into_iter().filter(|f| m.is_session_active(&f.session.id)).map(|f| f.session.id)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.session_browser = Some(SessionBrowser::new(trees, active_ids));
+            }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return;
+        }
+
+        // Session browser navigation (when open)
+        if let Some(browser) = &mut self.session_browser {
+            match logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.session_browser = None;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    if browser.selected_index > 0 {
+                        browser.selected_index -= 1;
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    if browser.selected_index + 1 < browser.display_entries.len() {
+                        browser.selected_index += 1;
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    browser.expand_at_selection();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    browser.collapse_at_selection();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    if browser.is_header_selected() {
+                        browser.toggle_expand();
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    } else if let Some(session) = browser.selected_session().cloned() {
+                        self.session_browser = None;
+                        self.resume_session(&session);
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::Tab) => {
+                    browser.toggle_active_only();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    browser.filter.pop();
+                    browser.apply_filter();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
+                _ => {
+                    if let Some(text) = text {
+                        if !ctrl && !super_key {
+                            browser.filter.push_str(text);
+                            browser.apply_filter();
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
 
         // --- Tab switcher (Ctrl+Tab / Ctrl+Shift+Tab) ---
         if ctrl && matches!(logical_key, Key::Named(NamedKey::Tab)) {
@@ -880,6 +1178,55 @@ impl App {
 }
 
 // ---------------------------------------------------------------------------
+// Session resume
+// ---------------------------------------------------------------------------
+
+impl App {
+    fn resume_session(&mut self, session: &nex_ai_session::AiSession) {
+        let claude = find_claude_cli();
+        let project_dir = session.project_dir.display();
+        let session_id = &session.id;
+
+        // Build the resume command with error handling wrapper
+        let command = format!(
+            "cd {project_dir} && {claude} --resume {session_id} || {{ \
+            echo ''; \
+            echo '╭──────────────────────────────────────────╮'; \
+            echo '│  Could not resume this session.           │'; \
+            echo '│  It may be active in another terminal.    │'; \
+            echo '│                                           │'; \
+            echo '│  Press Enter to close this pane.          │'; \
+            echo '╰──────────────────────────────────────────╯'; \
+            read; }}",
+            claude = claude.display(),
+        );
+
+        if let Some(mux) = &mut self.mux {
+            let area = Self::pane_area(self.renderer.as_ref().unwrap(), mux.tab_count() + 1);
+            let initial_blocks = self.block_store.as_ref()
+                .map(|s| s.get_all_for_pane(&mux.focused_pane_id()).len())
+                .unwrap_or(0);
+            match mux.open_session(session_id, area, &self.proxy, &command, initial_blocks) {
+                Ok(was_existing) => {
+                    if was_existing {
+                        tracing::info!(session_id, "Focused existing session tab");
+                    } else {
+                        tracing::info!(session_id, %project_dir, "Resuming Claude Code session in new tab");
+                    }
+                    mux.recalculate_bounds(area);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to resume session: {e}");
+                }
+            }
+        }
+
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+}
+
 // Rendering
 // ---------------------------------------------------------------------------
 
@@ -1037,7 +1384,65 @@ impl App {
             }
         });
 
-        if let Err(e) = renderer.render_frame(visible_tabs, tab_h, &pane_contents, &divider_lines, overlay.as_ref()) {
+        // Build session browser overlay if active
+        let session_overlay = self.session_browser.as_ref().map(|browser| {
+            let filter_display = if browser.active_only {
+                if browser.filter.is_empty() {
+                    "[Active] Search...".to_string()
+                } else {
+                    format!("[Active] {}", browser.filter)
+                }
+            } else {
+                browser.filter.clone()
+            };
+            let entries: Vec<nex_render::renderer::SessionOverlayEntry> = browser
+                .display_entries
+                .iter()
+                .enumerate()
+                .map(|(i, de)| {
+                    let kind = match &de.kind {
+                        DisplayEntryKind::ProjectHeader { name, count, expanded } => {
+                            nex_render::renderer::SessionEntryKind::ProjectHeader {
+                                name: name.clone(),
+                                session_count: *count,
+                                expanded: *expanded,
+                            }
+                        }
+                        DisplayEntryKind::Session { flat_entry } => {
+                            let s = &flat_entry.session;
+                            let tree_prefix = if flat_entry.depth == 0 {
+                                "  ".to_string()
+                            } else if flat_entry.is_last_child {
+                                "  └─ ".to_string()
+                            } else {
+                                "  ├─ ".to_string()
+                            };
+                            nex_render::renderer::SessionEntryKind::Session {
+                                project_name: s.project_name.clone(),
+                                summary: s.summary.clone(),
+                                time_ago: format_time_ago(s.updated_at),
+                                message_count: s.message_count,
+                                model: s.model.clone().unwrap_or_default(),
+                                is_active: browser.is_active_in_nexterm(&s.id),
+                                depth: flat_entry.depth,
+                                tree_prefix,
+                            }
+                        }
+                    };
+                    nex_render::renderer::SessionOverlayEntry {
+                        kind,
+                        is_selected: i == browser.selected_index,
+                    }
+                })
+                .collect();
+            nex_render::renderer::SessionOverlay {
+                entries,
+                selected_index: browser.selected_index,
+                filter: filter_display,
+            }
+        });
+
+        if let Err(e) = renderer.render_frame(visible_tabs, tab_h, &pane_contents, &divider_lines, overlay.as_ref(), session_overlay.as_ref()) {
             tracing::error!("Render error: {e}");
         }
 
@@ -1045,6 +1450,11 @@ impl App {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
+        }
+
+        // Clean up finished AI sessions (detect when claude --resume exits)
+        if let (Some(mux), Some(store)) = (&mut self.mux, &self.block_store) {
+            mux.cleanup_finished_sessions(store);
         }
 
         // Update MCP terminal state snapshot
@@ -1094,6 +1504,21 @@ fn find_claude_cli() -> std::path::PathBuf {
     .into_iter()
     .find(|p| p.exists())
     .unwrap_or_else(|| std::path::PathBuf::from("claude"))
+}
+
+/// Format a timestamp as a human-readable "time ago" string.
+fn format_time_ago(dt: chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let duration = now.signed_duration_since(dt);
+    let secs = duration.num_seconds();
+    if secs < 60 { return "just now".to_string(); }
+    let mins = duration.num_minutes();
+    if mins < 60 { return format!("{mins} min ago"); }
+    let hours = duration.num_hours();
+    if hours < 24 { return format!("{hours}h ago"); }
+    let days = duration.num_days();
+    if days < 30 { return format!("{days}d ago"); }
+    format!("{}mo ago", days / 30)
 }
 
 /// Best-effort MCP deregistration with Claude Code on shutdown.

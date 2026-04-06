@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 nex-common = { workspace = true }
+nex-block = { workspace = true }
 nex-pty = { workspace = true }
 nex-terminal = { workspace = true }
 nex-ipc = { workspace = true }

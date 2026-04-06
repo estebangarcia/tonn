@@ -17,6 +17,7 @@ nex-pty = { workspace = true }
 nex-mux = { workspace = true }
 nex-block = { workspace = true }
 nex-mcp = { workspace = true }
+nex-ai-session = { workspace = true }
 nex-render = { workspace = true }
 nex-ipc = { workspace = true }
 nex-shell-integration = { workspace = true }
@@ -33,6 +34,7 @@ anyhow = { workspace = true }
 pollster = { workspace = true }
 arboard = { workspace = true }
 dirs = { workspace = true }
+chrono = { workspace = true }
 nex-token-save = { workspace = true }
 alacritty_terminal = { workspace = true }
 

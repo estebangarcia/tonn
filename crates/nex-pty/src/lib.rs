@@ -95,20 +95,19 @@ impl NexPty {
                     // .zshenv: keep ZDOTDIR as wrapper dir (so zsh finds our .zshrc),
                     // but source user's .zshenv from their home.
                     let zshenv = format!(
-                        r#"# Preserve history file — use $HOME which never changes with ZDOTDIR
-HISTFILE="${{HISTFILE:-$HOME/.zsh_history}}"
-NEXTERM_USER_ZDOTDIR="{user_zdotdir}"
+                        r#"NEXTERM_USER_ZDOTDIR="{user_zdotdir}"
 [[ -f "{user_zdotdir}/.zshenv" ]] && ZDOTDIR="{user_zdotdir}" source "{user_zdotdir}/.zshenv"
 "#
                     );
                     std::fs::write(zdotdir.join(".zshenv"), zshenv).ok();
 
-                    // .zshrc: source user's .zshrc (with ZDOTDIR temporarily restored
-                    // so plugins like Powerlevel10k see the right value), then permanently
-                    // restore ZDOTDIR and source our integration.
+                    // .zshrc: source user's config first, then fix HISTFILE if it
+                    // points to our wrapper dir, then source our integration.
                     let zshrc = format!(
                         r#"ZDOTDIR="{user_zdotdir}"
 [[ -f "{user_zdotdir}/.zshrc" ]] && source "{user_zdotdir}/.zshrc"
+# Fix HISTFILE if it got set to the wrapper ZDOTDIR
+[[ "$HISTFILE" == *"/nexterm/"* ]] && HISTFILE="$HOME/.zsh_history"
 source "{script_path}/nexterm.zsh"
 "#
                     );
