@@ -12,13 +12,9 @@ members = [
     "crates/nex-autocomplete",
     "crates/nex-token-save",
     "crates/nex-shell-integration",
-    "crates/nex-plugin",
     "crates/nex-config",
     "crates/nex-ipc",
     "crates/nex-common",
-    "plugins/plugin-claude-code",
-    "plugins/plugin-opencode",
-    "plugins/plugin-gemini-cli",
 ]
 
 [workspace.package]

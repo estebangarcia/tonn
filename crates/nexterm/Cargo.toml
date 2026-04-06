@@ -38,8 +38,3 @@ chrono = { workspace = true }
 nex-token-save = { workspace = true }
 alacritty_terminal = { workspace = true }
 
-[features]
-default = ["plugin-claude-code"]
-plugin-claude-code = []
-plugin-opencode = []
-plugin-gemini-cli = []

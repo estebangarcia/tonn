@@ -78,7 +78,7 @@ const OVERLAY_NORMAL_TEXT_COLOR: [u8; 3] = [170, 170, 180];
 // Session browser overlay
 const SESSION_PANEL_WIDTH_LOGICAL: f32 = 520.0;
 const SESSION_ENTRY_HEIGHT_LOGICAL: f32 = 48.0;
-const SESSION_SEARCH_HEIGHT_LOGICAL: f32 = 24.0; // matches half an entry (one text line)
+const SESSION_SEARCH_HEIGHT_LOGICAL: f32 = 48.0; // two text lines: tab bar + search input
 const SESSION_PADDING_LOGICAL: f32 = 12.0;
 const SESSION_MAX_HEIGHT_RATIO: f32 = 0.75;
 const SESSION_FONT_SIZE_LOGICAL: f32 = 14.0;
@@ -884,7 +884,7 @@ impl Renderer {
                         }
 
                         if !summary.is_empty() {
-                            let prefix_len = tree_prefix.len() + active_prefix.len() + 1; // +1 for opening quote
+                            let prefix_len = tree_prefix.chars().count() + active_prefix.len() + 1; // +1 for opening quote
                             let summary_budget = max_chars.saturating_sub(prefix_len + 1); // +1 for closing quote
                             let summary_display = if summary.chars().count() > summary_budget && summary_budget > 4 {
                                 let truncated: String = summary.chars().take(summary_budget - 1).collect();
@@ -899,7 +899,8 @@ impl Renderer {
                         }
 
                         // Line 2: indent + time_ago · N messages · model
-                        let indent = " ".repeat(tree_prefix.len() + active_prefix.len());
+                        // Use char count, not byte length (tree chars like ├─ are multi-byte)
+                        let indent = " ".repeat(tree_prefix.chars().count() + active_prefix.len());
                         let detail_line = format!(
                             "\n{indent}{time_ago} · {message_count} messages · {model}",
                         );

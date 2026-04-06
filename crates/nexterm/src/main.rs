@@ -104,9 +104,15 @@ struct TabSwitcher {
     selected_index: usize,
 }
 
+/// Filter tabs for the session browser.
+const SESSION_FILTER_ALL: &str = "All";
+const SESSION_FILTER_ACTIVE: &str = "Active";
+
 struct SessionBrowser {
     trees: Vec<nex_ai_session::SessionTree>,
-    nexterm_active_ids: Vec<String>,  // session IDs running in Nexterm panes
+    nexterm_active_ids: Vec<String>,
+    tool_names: Vec<String>,        // provider names from registered providers
+    selected_tab: usize,            // 0=All, 1..N=tool, N+1=Active
     display_entries: Vec<DisplayEntry>,
     selected_index: usize,
     filter: String,
@@ -124,12 +130,18 @@ enum DisplayEntryKind {
 }
 
 impl SessionBrowser {
-    fn new(trees: Vec<nex_ai_session::SessionTree>, nexterm_active_ids: Vec<String>) -> Self {
+    fn new(
+        trees: Vec<nex_ai_session::SessionTree>,
+        nexterm_active_ids: Vec<String>,
+        tool_names: Vec<String>,
+    ) -> Self {
         let expanded_projects: std::collections::HashSet<String> =
             trees.iter().map(|t| t.project_name.clone()).collect();
         let mut browser = Self {
             trees,
             nexterm_active_ids,
+            tool_names,
+            selected_tab: 0,
             display_entries: Vec::new(),
             selected_index: 0,
             filter: String::new(),
@@ -140,9 +152,40 @@ impl SessionBrowser {
         browser
     }
 
+    fn tab_labels(&self) -> Vec<String> {
+        let mut labels = vec![SESSION_FILTER_ALL.to_string()];
+        labels.extend(self.tool_names.clone());
+        labels.push(SESSION_FILTER_ACTIVE.to_string());
+        labels
+    }
+
+    fn cycle_tab(&mut self, forward: bool) {
+        let count = self.tab_labels().len();
+        if forward {
+            self.selected_tab = (self.selected_tab + 1) % count;
+        } else {
+            self.selected_tab = (self.selected_tab + count - 1) % count;
+        }
+        // Update active_only based on tab
+        let labels = self.tab_labels();
+        self.active_only = labels.get(self.selected_tab).map_or(false, |l| l == SESSION_FILTER_ACTIVE);
+        self.rebuild_display();
+    }
+
+    fn selected_tool_filter(&self) -> Option<&str> {
+        let labels = self.tab_labels();
+        let label = labels.get(self.selected_tab)?;
+        if label == SESSION_FILTER_ALL || label == SESSION_FILTER_ACTIVE {
+            None
+        } else {
+            Some(self.tool_names.get(self.selected_tab - 1).map(|s| s.as_str())?)
+        }
+    }
+
     fn rebuild_display(&mut self) {
         self.display_entries.clear();
         let query = self.filter.to_lowercase();
+        let tool_filter = self.selected_tool_filter().map(|s| s.to_string());
 
         for tree in &self.trees {
             let mut flat: Vec<nex_ai_session::FlatSessionEntry> = Vec::new();
@@ -153,6 +196,12 @@ impl SessionBrowser {
             let filtered_flat: Vec<nex_ai_session::FlatSessionEntry> = flat
                 .into_iter()
                 .filter(|f| {
+                    // Tool filter
+                    if let Some(ref tool_name) = tool_filter {
+                        if f.session.tool.to_string() != *tool_name {
+                            return false;
+                        }
+                    }
                     if self.active_only && !self.is_active_in_nexterm(&f.session.id) {
                         return false;
                     }
@@ -195,11 +244,6 @@ impl SessionBrowser {
     }
 
     fn apply_filter(&mut self) {
-        self.rebuild_display();
-    }
-
-    fn toggle_active_only(&mut self) {
-        self.active_only = !self.active_only;
         self.rebuild_display();
     }
 
@@ -820,7 +864,8 @@ impl App {
                             .collect()
                     })
                     .unwrap_or_default();
-                self.session_browser = Some(SessionBrowser::new(trees, active_ids));
+                let tool_names = mgr.provider_names();
+                self.session_browser = Some(SessionBrowser::new(trees, active_ids, tool_names));
             }
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -883,7 +928,7 @@ impl App {
                     return;
                 }
                 Key::Named(NamedKey::Tab) => {
-                    browser.toggle_active_only();
+                    browser.cycle_tab(!shift);
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -1183,23 +1228,14 @@ impl App {
 
 impl App {
     fn resume_session(&mut self, session: &nex_ai_session::AiSession) {
-        let claude = find_claude_cli();
-        let project_dir = session.project_dir.display();
         let session_id = &session.id;
+        let project_dir = session.project_dir.display();
 
-        // Build the resume command with error handling wrapper
-        let command = format!(
-            "cd {project_dir} && {claude} --resume {session_id} || {{ \
-            echo ''; \
-            echo '╭──────────────────────────────────────────╮'; \
-            echo '│  Could not resume this session.           │'; \
-            echo '│  It may be active in another terminal.    │'; \
-            echo '│                                           │'; \
-            echo '│  Press Enter to close this pane.          │'; \
-            echo '╰──────────────────────────────────────────╯'; \
-            read; }}",
-            claude = claude.display(),
-        );
+        let command = self
+            .session_manager
+            .as_ref()
+            .map(|mgr| mgr.resume_command(session))
+            .unwrap_or_default();
 
         if let Some(mux) = &mut self.mux {
             let area = Self::pane_area(self.renderer.as_ref().unwrap(), mux.tab_count() + 1);
@@ -1386,14 +1422,19 @@ impl App {
 
         // Build session browser overlay if active
         let session_overlay = self.session_browser.as_ref().map(|browser| {
-            let filter_display = if browser.active_only {
-                if browser.filter.is_empty() {
-                    "[Active] Search...".to_string()
+            // Build tab bar + filter display
+            let tab_labels = browser.tab_labels();
+            let tab_bar: String = tab_labels.iter().enumerate().map(|(i, label)| {
+                if i == browser.selected_tab {
+                    format!("[{label}]")
                 } else {
-                    format!("[Active] {}", browser.filter)
+                    format!(" {label} ")
                 }
+            }).collect::<Vec<_>>().join("  ");
+            let filter_display = if browser.filter.is_empty() {
+                format!("{tab_bar}\nSearch...")
             } else {
-                browser.filter.clone()
+                format!("{tab_bar}\n{}", browser.filter)
             };
             let entries: Vec<nex_render::renderer::SessionOverlayEntry> = browser
                 .display_entries
@@ -1412,10 +1453,30 @@ impl App {
                             let s = &flat_entry.session;
                             let tree_prefix = if flat_entry.depth == 0 {
                                 "  ".to_string()
-                            } else if flat_entry.is_last_child {
-                                "  └─ ".to_string()
                             } else {
-                                "  ├─ ".to_string()
+                                // Check if this is the last visible sibling at this depth
+                                let is_last_visible = {
+                                    let current_idx = i;
+                                    let mut is_last = true;
+                                    for j in (current_idx + 1)..browser.display_entries.len() {
+                                        if let DisplayEntryKind::Session { flat_entry: next } = &browser.display_entries[j].kind {
+                                            if next.depth == flat_entry.depth {
+                                                is_last = false;
+                                                break;
+                                            }
+                                            if next.depth < flat_entry.depth {
+                                                break;
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    is_last
+                                };
+                                // Indent deeper levels further
+                                let depth_indent = "   ".repeat(flat_entry.depth);
+                                let connector = if is_last_visible { "└─ " } else { "├─ " };
+                                format!("{depth_indent}{connector}")
                             };
                             nex_render::renderer::SessionEntryKind::Session {
                                 project_name: s.project_name.clone(),
