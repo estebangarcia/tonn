@@ -22,3 +22,5 @@ config.toml
 # Environment
 .env
 .env.local
+
+.claude/
