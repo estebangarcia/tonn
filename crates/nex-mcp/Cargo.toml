@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 nex-common = { workspace = true }
 nex-block = { workspace = true }
+nex-ai-session = { workspace = true }
 rmcp = { workspace = true }
 schemars = { workspace = true }
 tokio = { workspace = true }

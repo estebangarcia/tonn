@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use nex_ai_session::SessionManager;
 use nex_block::{Block, BlockStore};
 use nex_common::{BlockId, PaneId};
 use parking_lot::Mutex;
@@ -114,6 +115,43 @@ struct ExecuteParams {
     pane_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GetSessionParams {
+    /// The session ID to retrieve.
+    session_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// Session serialization helpers
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct SessionSummary {
+    id: String,
+    project_name: String,
+    project_dir: String,
+    summary: String,
+    message_count: usize,
+    model: Option<String>,
+    tool: String,
+    created_at: String,
+    updated_at: String,
+}
+
+fn session_to_summary(session: &nex_ai_session::AiSession) -> SessionSummary {
+    SessionSummary {
+        id: session.id.clone(),
+        project_name: session.project_name.clone(),
+        project_dir: session.project_dir.to_string_lossy().to_string(),
+        summary: session.summary.clone(),
+        message_count: session.message_count,
+        model: session.model.clone(),
+        tool: format!("{:?}", session.tool),
+        created_at: session.created_at.to_rfc3339(),
+        updated_at: session.updated_at.to_rfc3339(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Block serialization helpers
 // ---------------------------------------------------------------------------
@@ -218,6 +256,7 @@ pub struct NextermMcpServer {
     block_store: Arc<BlockStore>,
     terminal_state: Arc<Mutex<TerminalStateSnapshot>>,
     execute_tx: ExecuteSender,
+    session_manager: Arc<SessionManager>,
     tool_router: ToolRouter<NextermMcpServer>,
 }
 
@@ -226,11 +265,13 @@ impl NextermMcpServer {
         block_store: Arc<BlockStore>,
         terminal_state: Arc<Mutex<TerminalStateSnapshot>>,
         execute_tx: ExecuteSender,
+        session_manager: Arc<SessionManager>,
     ) -> Self {
         Self {
             block_store,
             terminal_state,
             execute_tx,
+            session_manager,
             tool_router: Self::tool_router(),
         }
     }
@@ -362,6 +403,39 @@ impl NextermMcpServer {
         let state = self.terminal_state.lock();
         let json = serde_json::to_string_pretty(&state.panes).unwrap_or_default();
         Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// List all discovered AI coding sessions across projects.
+    #[tool(
+        name = "list_sessions",
+        description = "List all discovered AI coding sessions across projects. Returns session IDs, project names, summaries, timestamps, and message counts. Use get_session for details."
+    )]
+    fn list_sessions(&self) -> Result<CallToolResult, McpError> {
+        let sessions = self.session_manager.all_sessions_sorted();
+        let summaries: Vec<SessionSummary> = sessions.iter().map(session_to_summary).collect();
+        let json = serde_json::to_string_pretty(&summaries).unwrap_or_default();
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// Get details of a specific AI coding session by its ID.
+    #[tool(
+        name = "get_session",
+        description = "Get details of a specific AI coding session by its ID."
+    )]
+    fn get_session(
+        &self,
+        rmcp::handler::server::wrapper::Parameters(params): rmcp::handler::server::wrapper::Parameters<GetSessionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.session_manager.get(&params.session_id) {
+            Some(session) => {
+                let json = serde_json::to_string_pretty(&session_to_summary(&session))
+                    .unwrap_or_default();
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
+            None => Ok(CallToolResult::error(vec![Content::text(
+                format!("Session {} not found", params.session_id),
+            )])),
+        }
     }
 
     /// Execute a shell command in a terminal pane.

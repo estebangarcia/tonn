@@ -20,6 +20,14 @@ use parking_lot::Mutex;
 
 pub const DEFAULT_TAB_TITLE: &str = "Terminal";
 
+/// Tracks an AI session running in a Nexterm pane.
+#[derive(Debug, Clone)]
+pub struct ActiveSession {
+    pub tab_index: usize,
+    pub pane_id: PaneId,
+    pub initial_block_count: usize,
+}
+
 /// Pixel rectangle for a pane's viewport within the window.
 #[derive(Debug, Clone, Copy)]
 pub struct Rect {
@@ -54,6 +62,9 @@ pub struct Mux {
     scale_factor: f32,
     block_event_tx: Sender<BlockEvent>,
     mcp_port: Option<u16>,
+    /// Maps AI session IDs to (tab_index, pane_id, initial_block_count).
+    /// The block count at resume time lets us detect when the command finishes.
+    active_sessions: HashMap<String, ActiveSession>,
 }
 
 impl Mux {
@@ -78,6 +89,7 @@ impl Mux {
             scale_factor,
             block_event_tx,
             mcp_port,
+            active_sessions: HashMap::new(),
         };
 
         let pane_id = mux.spawn_pane(initial_bounds, &event_proxy)?;
@@ -141,6 +153,76 @@ impl Mux {
         Ok(tab_id)
     }
 
+    /// Create a new tab and immediately send an initial command to its PTY.
+    /// Used for session resume: spawns a shell, then types the command + Enter.
+    pub fn new_tab_with_command<Proxy: MuxEventProxy + 'static>(
+        &mut self,
+        bounds: Rect,
+        event_proxy: &Proxy,
+        command: &str,
+    ) -> anyhow::Result<TabId> {
+        let tab_id = self.new_tab(bounds, event_proxy)?;
+        if let Some(writer) = self.focused_pane_writer() {
+            let mut w = writer.lock();
+            let _ = w.write_all(command.as_bytes());
+            let _ = w.write_all(b"\r");
+            let _ = w.flush();
+        }
+        Ok(tab_id)
+    }
+
+    /// Open a new tab for an AI session, or focus the existing tab if already active.
+    /// Returns true if an existing tab was focused, false if a new one was created.
+    pub fn open_session<Proxy: MuxEventProxy + 'static>(
+        &mut self,
+        session_id: &str,
+        bounds: Rect,
+        event_proxy: &Proxy,
+        command: &str,
+        initial_block_count: usize,
+    ) -> anyhow::Result<bool> {
+        // Check if session is already active in a tab
+        if let Some(active) = self.active_sessions.get(session_id) {
+            if active.tab_index < self.tabs.len() {
+                let idx = active.tab_index;
+                self.switch_tab(idx);
+                return Ok(true);
+            }
+            self.active_sessions.remove(session_id);
+        }
+
+        let _tab_id = self.new_tab_with_command(bounds, event_proxy, command)?;
+        let tab_idx = self.tabs.len() - 1;
+        let pane_id = self.focused_pane;
+        self.active_sessions.insert(session_id.to_string(), ActiveSession {
+            tab_index: tab_idx,
+            pane_id,
+            initial_block_count,
+        });
+        Ok(false)
+    }
+
+    /// Check if a session is currently active in a tab.
+    pub fn is_session_active(&self, session_id: &str) -> bool {
+        self.active_sessions.contains_key(session_id)
+    }
+
+    /// Remove sessions whose `claude --resume` command has finished.
+    /// Call this periodically with the BlockStore to detect completed sessions.
+    pub fn cleanup_finished_sessions(&mut self, block_store: &nex_block::BlockStore) {
+        let finished: Vec<String> = self.active_sessions.iter()
+            .filter(|(_, active)| {
+                let current_count = block_store.get_all_for_pane(&active.pane_id).len();
+                current_count > active.initial_block_count
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in finished {
+            tracing::debug!(session_id = %id, "Session command finished, removing from active");
+            self.active_sessions.remove(&id);
+        }
+    }
+
     pub fn close_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
@@ -148,6 +230,13 @@ impl Mux {
         let tab = self.tabs.remove(index);
         for pane_id in tab.layout.pane_ids() {
             self.panes.remove(&pane_id);
+        }
+        // Clean up session tracking — remove entries pointing to this tab and fix indices
+        self.active_sessions.retain(|_, active| active.tab_index != index);
+        for active in self.active_sessions.values_mut() {
+            if active.tab_index > index {
+                active.tab_index -= 1;
+            }
         }
         if self.tabs.is_empty() {
             return; // caller should exit

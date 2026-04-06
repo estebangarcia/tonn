@@ -66,14 +66,31 @@ const OVERLAY_ENTRY_HEIGHT_LOGICAL: f32 = 32.0;
 const OVERLAY_PADDING_LOGICAL: f32 = 12.0;
 const OVERLAY_MAX_HEIGHT_RATIO: f32 = 0.7;
 const OVERLAY_FONT_SIZE_LOGICAL: f32 = 14.0;
-const OVERLAY_DIM_ALPHA: f32 = 0.5;
+const OVERLAY_DIM_ALPHA: f32 = 0.75;
 const OVERLAY_ENTRY_INSET_LOGICAL: f32 = 4.0;
 const OVERLAY_ENTRY_GAP_LOGICAL: f32 = 2.0;
-const OVERLAY_PANEL_BG: [u8; 3] = [30, 30, 38];
-const OVERLAY_SELECTED_BG: [u8; 3] = [60, 100, 180];
-const OVERLAY_NORMAL_BG: [u8; 3] = [38, 38, 46];
+const OVERLAY_PANEL_BG: [u8; 3] = [50, 50, 62];
+const OVERLAY_SELECTED_BG: [u8; 3] = [55, 95, 175];
+const OVERLAY_NORMAL_BG: [u8; 3] = [58, 58, 68];
 const OVERLAY_SELECTED_TEXT_COLOR: [u8; 3] = [255, 255, 255];
 const OVERLAY_NORMAL_TEXT_COLOR: [u8; 3] = [170, 170, 180];
+
+// Session browser overlay
+const SESSION_PANEL_WIDTH_LOGICAL: f32 = 520.0;
+const SESSION_ENTRY_HEIGHT_LOGICAL: f32 = 48.0;
+const SESSION_SEARCH_HEIGHT_LOGICAL: f32 = 48.0; // two text lines: tab bar + search input
+const SESSION_PADDING_LOGICAL: f32 = 12.0;
+const SESSION_MAX_HEIGHT_RATIO: f32 = 0.75;
+const SESSION_FONT_SIZE_LOGICAL: f32 = 14.0;
+const SESSION_ENTRY_INSET_LOGICAL: f32 = 4.0;
+const SESSION_ENTRY_GAP_LOGICAL: f32 = 2.0;
+const SESSION_SEARCH_BAR_BG: [u8; 3] = [40, 40, 50];
+const SESSION_SEARCH_TEXT_COLOR: [u8; 3] = [200, 200, 210];
+const SESSION_SEARCH_PLACEHOLDER_COLOR: [u8; 3] = [100, 100, 115];
+const SESSION_ACTIVE_INDICATOR_COLOR: [u8; 3] = [80, 200, 120];
+const SESSION_SECONDARY_TEXT_COLOR: [u8; 3] = [120, 120, 135];
+const SESSION_CHAR_WIDTH_RATIO: f32 = 0.6;
+const SESSION_HEADER_SELECTED_BG: [u8; 3] = [65, 65, 80];
 
 fn glyphon_rgb(c: [u8; 3]) -> Color {
     Color::rgb(c[0], c[1], c[2])
@@ -128,6 +145,36 @@ pub struct OverlayEntry {
     pub is_active: bool,
 }
 
+/// Session browser overlay panel.
+pub struct SessionOverlay {
+    pub entries: Vec<SessionOverlayEntry>,
+    pub selected_index: usize,
+    pub filter: String,
+}
+
+pub enum SessionEntryKind {
+    ProjectHeader {
+        name: String,
+        session_count: usize,
+        expanded: bool,
+    },
+    Session {
+        project_name: String,
+        summary: String,
+        time_ago: String,
+        message_count: usize,
+        model: String,
+        is_active: bool,
+        depth: usize,
+        tree_prefix: String,
+    },
+}
+
+pub struct SessionOverlayEntry {
+    pub kind: SessionEntryKind,
+    pub is_selected: bool,
+}
+
 /// A divider line between split panes.
 pub struct DividerLine {
     pub x: f32,
@@ -167,6 +214,7 @@ pub struct Renderer {
     cursor_buffer: Buffer,
     tab_buffers: Vec<Buffer>,
     overlay_buffer: Buffer,
+    session_overlay_buffer: Buffer,
 }
 
 impl Renderer {
@@ -281,6 +329,10 @@ impl Renderer {
             OVERLAY_FONT_SIZE_LOGICAL * scale_factor, OVERLAY_ENTRY_HEIGHT_LOGICAL * scale_factor,
         ));
 
+        let session_overlay_buffer = Buffer::new(&mut font_system, Metrics::new(
+            SESSION_FONT_SIZE_LOGICAL * scale_factor, SESSION_ENTRY_HEIGHT_LOGICAL * scale_factor,
+        ));
+
         Ok(Self {
             device,
             queue,
@@ -298,6 +350,7 @@ impl Renderer {
             cursor_buffer,
             tab_buffers: Vec::new(),
             overlay_buffer,
+            session_overlay_buffer,
         })
     }
 
@@ -397,7 +450,10 @@ impl Renderer {
         self.pane_buffers.retain(|id, _| active_pane_ids.contains(id));
     }
 
-    /// Render a complete frame with tab bar, multiple panes, dividers, and optional overlay.
+    /// Render a complete frame with tab bar, multiple panes, dividers, and optional overlays.
+    ///
+    /// If both `overlay` (tab switcher) and `session_overlay` (session browser)
+    /// are provided, the session browser takes priority.
     pub fn render_frame(
         &mut self,
         tabs: &[TabInfo],
@@ -405,6 +461,7 @@ impl Renderer {
         panes: &[PaneContent],
         dividers: &[DividerLine],
         overlay: Option<&OverlayContent>,
+        session_overlay: Option<&SessionOverlay>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&TextureViewDescriptor::default());
@@ -423,43 +480,45 @@ impl Renderer {
         // --- Build all rect vertices (bg cells + selection + dividers + focus borders) ---
         let mut all_rect_vertices: Vec<RectVertex> = Vec::new();
 
-        for pane in panes {
-            let ox = pane.x;
-            let oy = pane.y;
+        // When an overlay is active, skip all pane content (bg cells, text, cursor)
+        // so it doesn't bleed through the dim
+        let has_overlay = overlay.is_some() || session_overlay.is_some();
 
-            // Background cells
-            for cell in &pane.bg_cells {
-                let x0 = ox + PADDING + cell.col as f32 * cw;
-                let y0 = oy + PADDING + cell.row as f32 * lh;
-                let color = [
-                    Self::srgb_to_linear(cell.r),
-                    Self::srgb_to_linear(cell.g),
-                    Self::srgb_to_linear(cell.b),
-                    1.0,
-                ];
-                all_rect_vertices.extend_from_slice(&self.build_rect_vertices(x0, y0, cw, lh, color));
-            }
+        if !has_overlay {
+            for pane in panes {
+                let ox = pane.x;
+                let oy = pane.y;
 
-            // Selection cells
-            let sel_color = Self::color3(SELECTION_COLOR);
-            for cell in &pane.selection_cells {
-                let x0 = ox + PADDING + cell.col as f32 * cw;
-                let y0 = oy + PADDING + cell.row as f32 * lh;
-                all_rect_vertices.extend_from_slice(&self.build_rect_vertices(x0, y0, cw, lh, sel_color));
-            }
+                // Background cells
+                for cell in &pane.bg_cells {
+                    let x0 = ox + PADDING + cell.col as f32 * cw;
+                    let y0 = oy + PADDING + cell.row as f32 * lh;
+                    let color = [
+                        Self::srgb_to_linear(cell.r),
+                        Self::srgb_to_linear(cell.g),
+                        Self::srgb_to_linear(cell.b),
+                        1.0,
+                    ];
+                    all_rect_vertices.extend_from_slice(&self.build_rect_vertices(x0, y0, cw, lh, color));
+                }
 
-            // Focus border (colored border around focused pane)
-            if pane.is_focused && panes.len() > 1 {
-                let border_color = Self::color3(FOCUS_BORDER_COLOR);
-                let t = FOCUS_BORDER_THICKNESS;
-                // Top
-                all_rect_vertices.extend_from_slice(&self.build_rect_vertices(ox, oy, pane.width, t, border_color));
-                // Bottom
-                all_rect_vertices.extend_from_slice(&self.build_rect_vertices(ox, oy + pane.height - t, pane.width, t, border_color));
-                // Left
-                all_rect_vertices.extend_from_slice(&self.build_rect_vertices(ox, oy, t, pane.height, border_color));
-                // Right
-                all_rect_vertices.extend_from_slice(&self.build_rect_vertices(ox + pane.width - t, oy, t, pane.height, border_color));
+                // Selection cells
+                let sel_color = Self::color3(SELECTION_COLOR);
+                for cell in &pane.selection_cells {
+                    let x0 = ox + PADDING + cell.col as f32 * cw;
+                    let y0 = oy + PADDING + cell.row as f32 * lh;
+                    all_rect_vertices.extend_from_slice(&self.build_rect_vertices(x0, y0, cw, lh, sel_color));
+                }
+
+                // Focus border (colored border around focused pane)
+                if pane.is_focused && panes.len() > 1 {
+                    let border_color = Self::color3(FOCUS_BORDER_COLOR);
+                    let t = FOCUS_BORDER_THICKNESS;
+                    all_rect_vertices.extend_from_slice(&self.build_rect_vertices(ox, oy, pane.width, t, border_color));
+                    all_rect_vertices.extend_from_slice(&self.build_rect_vertices(ox, oy + pane.height - t, pane.width, t, border_color));
+                    all_rect_vertices.extend_from_slice(&self.build_rect_vertices(ox, oy, t, pane.height, border_color));
+                    all_rect_vertices.extend_from_slice(&self.build_rect_vertices(ox + pane.width - t, oy, t, pane.height, border_color));
+                }
             }
         }
 
@@ -554,41 +613,44 @@ impl Renderer {
         // --- Phase 2: Build TextAreas from populated buffers ---
         let mut text_areas: Vec<TextArea> = Vec::new();
 
-        for pane in panes.iter() {
-            if let Some(buf) = self.pane_buffers.get(&pane.pane_id) {
+        // Skip pane text when an overlay covers the screen (text would render on top of dim)
+        if !has_overlay {
+            for pane in panes.iter() {
+                if let Some(buf) = self.pane_buffers.get(&pane.pane_id) {
+                    text_areas.push(TextArea {
+                        buffer: buf,
+                        left: pane.x + PADDING,
+                        top: pane.y + PADDING,
+                        scale: 1.0,
+                        bounds: TextBounds {
+                            left: (pane.x as i32).max(0),
+                            top: (pane.y as i32).max(0),
+                            right: ((pane.x + pane.width) as i32).min(sw),
+                            bottom: ((pane.y + pane.height) as i32).min(sh),
+                        },
+                        default_color: glyphon_rgb(DEFAULT_TEXT_COLOR),
+                        custom_glyphs: &[],
+                    });
+                }
+            }
+
+            if let Some((cx, cy, bl, bt, br, bb)) = cursor_info {
                 text_areas.push(TextArea {
-                    buffer: buf,
-                    left: pane.x + PADDING,
-                    top: pane.y + PADDING,
+                    buffer: &self.cursor_buffer,
+                    left: cx,
+                    top: cy,
                     scale: 1.0,
                     bounds: TextBounds {
-                        left: (pane.x as i32).max(0),
-                        top: (pane.y as i32).max(0),
-                        right: ((pane.x + pane.width) as i32).min(sw),
-                        bottom: ((pane.y + pane.height) as i32).min(sh),
+                        left: bl.max(0),
+                        top: bt.max(0),
+                        right: br.min(sw),
+                        bottom: bb.min(sh),
                     },
-                    default_color: glyphon_rgb(DEFAULT_TEXT_COLOR),
-                    custom_glyphs: &[],
-                });
-            }
-        }
-
-        if let Some((cx, cy, bl, bt, br, bb)) = cursor_info {
-            text_areas.push(TextArea {
-                buffer: &self.cursor_buffer,
-                left: cx,
-                top: cy,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: bl.max(0),
-                    top: bt.max(0),
-                    right: br.min(sw),
-                    bottom: bb.min(sh),
-                },
-                default_color: Color::rgba(CURSOR_COLOR[0], CURSOR_COLOR[1], CURSOR_COLOR[2], CURSOR_COLOR[3]),
+                    default_color: Color::rgba(CURSOR_COLOR[0], CURSOR_COLOR[1], CURSOR_COLOR[2], CURSOR_COLOR[3]),
                 custom_glyphs: &[],
             });
         }
+        } // end if !has_overlay
 
         // Tab titles — one buffer per tab, positioned to match its rectangle
         if !tabs.is_empty() {
@@ -651,8 +713,231 @@ impl Renderer {
             }
         }
 
-        // --- Overlay (tab switcher, etc.) ---
-        if let Some(overlay) = overlay {
+        // --- Overlay (session browser takes priority over tab switcher) ---
+        let show_tab_overlay = overlay.is_some() && session_overlay.is_none();
+        if let Some(session_ov) = session_overlay {
+            let scale = self.scale_factor;
+            let panel_w = SESSION_PANEL_WIDTH_LOGICAL * scale;
+            let entry_h = SESSION_ENTRY_HEIGHT_LOGICAL * scale;
+            let search_h = SESSION_SEARCH_HEIGHT_LOGICAL * scale;
+            let panel_padding = SESSION_PADDING_LOGICAL * scale;
+
+            // Cap visible entries to fit within screen height
+            let max_panel_h = sh as f32 * SESSION_MAX_HEIGHT_RATIO;
+            let content_budget = max_panel_h - search_h - panel_padding * 2.0;
+            let max_visible = (content_budget / entry_h).floor().max(1.0) as usize;
+            let total = session_ov.entries.len();
+            let visible_count = if total == 0 { 0 } else { total.min(max_visible) };
+            let is_empty = total == 0;
+
+            // Scroll window: keep selected entry visible
+            let scroll_offset = if session_ov.selected_index >= visible_count {
+                (session_ov.selected_index - visible_count + 1).min(total.saturating_sub(visible_count))
+            } else {
+                0
+            };
+
+            let empty_msg_h = if is_empty { entry_h } else { 0.0 };
+            let panel_h = search_h + entry_h * visible_count as f32 + empty_msg_h + panel_padding * 2.0;
+            let panel_x = (sw as f32 - panel_w) / 2.0;
+            let panel_y = (sh as f32 - panel_h) / 2.0;
+
+            // Dimmed background
+            let dim = [0.0_f32, 0.0, 0.0, OVERLAY_DIM_ALPHA];
+            all_rect_vertices.extend_from_slice(
+                &self.build_rect_vertices(0.0, 0.0, sw as f32, sh as f32, dim),
+            );
+
+            // Panel background
+            let panel_bg = Self::color3(OVERLAY_PANEL_BG);
+            all_rect_vertices.extend_from_slice(
+                &self.build_rect_vertices(panel_x, panel_y, panel_w, panel_h, panel_bg),
+            );
+
+            // Search bar background
+            let search_bg = Self::color3(SESSION_SEARCH_BAR_BG);
+            all_rect_vertices.extend_from_slice(
+                &self.build_rect_vertices(
+                    panel_x + SESSION_ENTRY_INSET_LOGICAL * scale,
+                    panel_y + panel_padding,
+                    panel_w - SESSION_ENTRY_INSET_LOGICAL * 2.0 * scale,
+                    search_h - SESSION_ENTRY_GAP_LOGICAL * scale,
+                    search_bg,
+                ),
+            );
+
+            // Entry backgrounds
+            let entries_top = panel_y + panel_padding + search_h;
+            for vi in 0..visible_count {
+                let entry_idx = scroll_offset + vi;
+                let ey = entries_top + vi as f32 * entry_h;
+                let entry = &session_ov.entries[entry_idx];
+                let is_header = matches!(entry.kind, SessionEntryKind::ProjectHeader { .. });
+                let color = if entry.is_selected {
+                    if is_header {
+                        Self::color3(SESSION_HEADER_SELECTED_BG)
+                    } else {
+                        Self::color3(OVERLAY_SELECTED_BG)
+                    }
+                } else {
+                    Self::color3(OVERLAY_NORMAL_BG)
+                };
+                all_rect_vertices.extend_from_slice(
+                    &self.build_rect_vertices(
+                        panel_x + SESSION_ENTRY_INSET_LOGICAL * scale,
+                        ey,
+                        panel_w - SESSION_ENTRY_INSET_LOGICAL * 2.0 * scale,
+                        entry_h - SESSION_ENTRY_GAP_LOGICAL * scale,
+                        color,
+                    ),
+                );
+            }
+
+            // Build text spans for the session overlay buffer
+            let primary_font_size = SESSION_FONT_SIZE_LOGICAL * scale;
+            // Each entry is 2 text lines, so line height = entry_h / 2
+            let text_line_height = entry_h / 2.0;
+            let session_metrics = Metrics::new(primary_font_size, text_line_height);
+            self.session_overlay_buffer.set_metrics(&mut self.font_system, session_metrics);
+            self.session_overlay_buffer.set_size(&mut self.font_system, Some(panel_w), Some(panel_h));
+            self.session_overlay_buffer.set_wrap(&mut self.font_system, cosmic_text::Wrap::None);
+
+            // Estimate max chars per line
+            let char_w = primary_font_size * SESSION_CHAR_WIDTH_RATIO;
+            let usable_w = panel_w - panel_padding * 2.0;
+            let max_chars = (usable_w / char_w).floor().max(10.0) as usize;
+
+            let mut rich_spans: Vec<(String, Attrs)> = Vec::new();
+
+            // Search bar text
+            if session_ov.filter.is_empty() {
+                rich_spans.push((
+                    "Search sessions...".to_string(),
+                    Attrs::new().family(mono).color(glyphon_rgb(SESSION_SEARCH_PLACEHOLDER_COLOR)),
+                ));
+            } else {
+                rich_spans.push((
+                    session_ov.filter.clone(),
+                    Attrs::new().family(mono).color(glyphon_rgb(SESSION_SEARCH_TEXT_COLOR)),
+                ));
+            }
+
+            // Empty state message
+            if is_empty {
+                rich_spans.push(("\n".to_string(), Attrs::new().family(mono)));
+                rich_spans.push((
+                    "  No sessions found".to_string(),
+                    Attrs::new().family(mono).color(glyphon_rgb(SESSION_SEARCH_PLACEHOLDER_COLOR)),
+                ));
+            }
+
+            // Entry lines
+            for vi in 0..visible_count {
+                let entry_idx = scroll_offset + vi;
+                let entry = &session_ov.entries[entry_idx];
+
+                let primary_color = if entry.is_selected {
+                    glyphon_rgb(OVERLAY_SELECTED_TEXT_COLOR)
+                } else {
+                    glyphon_rgb(OVERLAY_NORMAL_TEXT_COLOR)
+                };
+                let secondary_color = if entry.is_selected {
+                    glyphon_rgb(OVERLAY_NORMAL_TEXT_COLOR)
+                } else {
+                    glyphon_rgb(SESSION_SECONDARY_TEXT_COLOR)
+                };
+
+                match &entry.kind {
+                    SessionEntryKind::ProjectHeader { name, session_count, expanded } => {
+                        let arrow = if *expanded { "▾" } else { "▸" };
+                        // Line 1: "▾ project_name (N sessions)"
+                        rich_spans.push(("\n".to_string(), Attrs::new().family(mono)));
+                        rich_spans.push((
+                            format!("{arrow} {name} ({session_count} sessions)"),
+                            Attrs::new().family(mono).weight(Weight::BOLD).color(primary_color),
+                        ));
+                        // Line 2: empty (fills the 2-line entry height)
+                        rich_spans.push(("\n".to_string(), Attrs::new().family(mono)));
+                    }
+                    SessionEntryKind::Session { summary, is_active, tree_prefix, time_ago, message_count, model, .. } => {
+                        // Line 1: tree_prefix + [●] "summary..."
+                        rich_spans.push(("\n".to_string(), Attrs::new().family(mono)));
+
+                        if !tree_prefix.is_empty() {
+                            rich_spans.push((
+                                tree_prefix.clone(),
+                                Attrs::new().family(mono).color(secondary_color),
+                            ));
+                        }
+
+                        let active_prefix = if *is_active { "● " } else { "  " };
+                        if *is_active {
+                            rich_spans.push((
+                                active_prefix.to_string(),
+                                Attrs::new().family(mono).color(glyphon_rgb(SESSION_ACTIVE_INDICATOR_COLOR)),
+                            ));
+                        } else {
+                            rich_spans.push((
+                                active_prefix.to_string(),
+                                Attrs::new().family(mono).color(primary_color),
+                            ));
+                        }
+
+                        if !summary.is_empty() {
+                            let prefix_len = tree_prefix.chars().count() + active_prefix.len() + 1; // +1 for opening quote
+                            let summary_budget = max_chars.saturating_sub(prefix_len + 1); // +1 for closing quote
+                            let summary_display = if summary.chars().count() > summary_budget && summary_budget > 4 {
+                                let truncated: String = summary.chars().take(summary_budget - 1).collect();
+                                format!("{truncated}…")
+                            } else {
+                                summary.clone()
+                            };
+                            rich_spans.push((
+                                format!("\"{summary_display}\""),
+                                Attrs::new().family(mono).color(primary_color),
+                            ));
+                        }
+
+                        // Line 2: indent + time_ago · N messages · model
+                        // Use char count, not byte length (tree chars like ├─ are multi-byte)
+                        let indent = " ".repeat(tree_prefix.chars().count() + active_prefix.len());
+                        let detail_line = format!(
+                            "\n{indent}{time_ago} · {message_count} messages · {model}",
+                        );
+                        rich_spans.push((
+                            detail_line,
+                            Attrs::new()
+                                .family(mono)
+                                .color(secondary_color),
+                        ));
+                    }
+                }
+            }
+
+            let rich_refs: Vec<(&str, Attrs)> = rich_spans.iter().map(|(t, a)| (t.as_str(), a.clone())).collect();
+            self.session_overlay_buffer.set_rich_text(
+                &mut self.font_system, rich_refs, &default_attrs, Shaping::Advanced, None,
+            );
+            self.session_overlay_buffer.shape_until_scroll(&mut self.font_system, false);
+
+            text_areas.push(TextArea {
+                buffer: &self.session_overlay_buffer,
+                left: panel_x + panel_padding,
+                top: panel_y + panel_padding,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: panel_x as i32,
+                    top: panel_y as i32,
+                    right: (panel_x + panel_w) as i32,
+                    bottom: (panel_y + panel_h) as i32,
+                },
+                default_color: glyphon_rgb(SECONDARY_TEXT_COLOR),
+                custom_glyphs: &[],
+            });
+        }
+
+        if show_tab_overlay {
+            let overlay = overlay.unwrap(); // safe: checked above
             let scale = self.scale_factor;
             let panel_w = OVERLAY_PANEL_WIDTH_LOGICAL * scale;
             let entry_h = OVERLAY_ENTRY_HEIGHT_LOGICAL * scale;
