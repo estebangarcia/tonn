@@ -28,6 +28,8 @@ const SCROLL_LINE_MULTIPLIER: i32 = 3;
 const SCROLL_PIXEL_DIVISOR: f64 = 20.0;
 const RESIZE_DEBOUNCE_MS: u64 = 50;
 const DIVIDER_RENDER_THICKNESS: f32 = 4.0;
+const EXECUTE_STDOUT_MAX_CHARS: usize = 4000;
+const EXECUTE_STDERR_MAX_CHARS: usize = 2000;
 use nex_terminal::{
     Column, Dimensions, Line, Point, Selection, SelectionType, Side,
     read_grid_content,
@@ -37,13 +39,26 @@ use nex_terminal::{
 // UserEvent + MuxEventProxy bridge
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
 enum UserEvent {
     PtyExited(PaneId),
     Title(PaneId, String),
     ResetTitle(PaneId),
     Bell(PaneId),
     Redraw,
+    McpExecute(nex_mcp::ExecuteCommand),
+}
+
+impl std::fmt::Debug for UserEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PtyExited(id) => write!(f, "PtyExited({id})"),
+            Self::Title(id, t) => write!(f, "Title({id}, {t})"),
+            Self::ResetTitle(id) => write!(f, "ResetTitle({id})"),
+            Self::Bell(id) => write!(f, "Bell({id})"),
+            Self::Redraw => write!(f, "Redraw"),
+            Self::McpExecute(cmd) => write!(f, "McpExecute({})", cmd.command),
+        }
+    }
 }
 
 /// Adapts winit's EventLoopProxy to the MuxEventProxy trait.
@@ -102,6 +117,8 @@ struct App {
     tab_switcher: Option<TabSwitcher>,
     last_tab_count: usize,
     last_active_tab: usize,
+    terminal_state: Option<Arc<parking_lot::Mutex<nex_mcp::TerminalStateSnapshot>>>,
+    block_store: Option<Arc<nex_block::BlockStore>>,
     /// Pending resize: we debounce rapid resize events and only apply the final one.
     pending_resize: Option<(u32, u32, std::time::Instant)>,
 }
@@ -121,6 +138,8 @@ impl App {
             tab_switcher: None,
             last_tab_count: 1,
             last_active_tab: 0,
+            terminal_state: None,
+            block_store: None,
             pending_resize: None,
         }
     }
@@ -189,6 +208,7 @@ impl ApplicationHandler<UserEvent> for App {
                     mux.close_pane(pane_id);
                     if mux.tab_count() == 0 {
                         tracing::info!("All tabs closed, exiting");
+                        deregister_mcp();
                         event_loop.exit();
                         return;
                     }
@@ -232,6 +252,55 @@ impl ApplicationHandler<UserEvent> for App {
                     window.request_redraw();
                 }
             }
+            UserEvent::McpExecute(cmd) => {
+                tracing::debug!(command = %cmd.command, "MCP execute: running as subprocess");
+
+                // Get CWD from terminal state for the subprocess
+                let cwd = self.terminal_state.as_ref()
+                    .and_then(|ts| {
+                        let state = ts.lock();
+                        state.active_pane_id.as_ref()
+                            .and_then(|active_id| {
+                                state.panes.iter()
+                                    .find(|p| &p.id == active_id)
+                                    .and_then(|p| if p.cwd.is_empty() { None } else { Some(p.cwd.clone()) })
+                            })
+                    });
+
+                // Run as subprocess — don't write to PTY (which might be running Claude Code)
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+                std::thread::spawn(move || {
+                    let mut child = std::process::Command::new(&shell);
+                    child.args(["-c", &cmd.command]);
+                    if let Some(dir) = &cwd {
+                        child.current_dir(dir);
+                    }
+                    child.env("TERM", "dumb"); // no ANSI in captured output
+
+                    let result = match child.output() {
+                        Ok(output) => {
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            let exit_code = output.status.code().unwrap_or(-1);
+                            let mut result = format!("Exit code: {exit_code}");
+                            if let Some(dir) = &cwd {
+                                result.push_str(&format!("\nCWD: {dir}"));
+                            }
+                            if !stdout.is_empty() {
+                                let truncated: String = stdout.chars().take(EXECUTE_STDOUT_MAX_CHARS).collect();
+                                result.push_str(&format!("\n\nSTDOUT:\n{truncated}"));
+                            }
+                            if !stderr.is_empty() {
+                                let truncated: String = stderr.chars().take(EXECUTE_STDERR_MAX_CHARS).collect();
+                                result.push_str(&format!("\n\nSTDERR:\n{truncated}"));
+                            }
+                            result
+                        }
+                        Err(e) => format!("Failed to run command: {e}"),
+                    };
+                    let _ = cmd.response_tx.send(result);
+                });
+            }
         }
     }
 
@@ -256,6 +325,12 @@ impl ApplicationHandler<UserEvent> for App {
 
                 let (block_tx, block_rx) = nex_ipc::block_channel();
 
+                // Pre-allocate MCP port so PTY shells get NEXTERM_MCP_PORT
+                let mcp_port = std::net::TcpListener::bind("127.0.0.1:0")
+                    .ok()
+                    .and_then(|l| l.local_addr().ok())
+                    .map(|a| a.port());
+
                 // Spawn block processor thread
                 let block_store = Arc::new(nex_block::BlockStore::new());
                 let store_clone = Arc::clone(&block_store);
@@ -273,11 +348,100 @@ impl ApplicationHandler<UserEvent> for App {
                     renderer.scale_factor(),
                     block_tx,
                     self.proxy.clone(),
+                    mcp_port,
                 )
                 .expect("Failed to create mux");
 
                 tracing::info!("Mux initialized with 1 tab, 1 pane");
                 self.mux = Some(mux);
+
+                // Store block_store for MCP state updates
+                self.block_store = Some(Arc::clone(&block_store));
+
+                // Start MCP server
+                let terminal_state = Arc::new(parking_lot::Mutex::new(
+                    nex_mcp::TerminalStateSnapshot::default(),
+                ));
+                self.terminal_state = Some(Arc::clone(&terminal_state));
+                let (execute_tx, execute_rx) = std::sync::mpsc::channel::<nex_mcp::ExecuteCommand>();
+
+                // Wire execute commands from MCP to the main event loop.
+                // Uses std::sync::mpsc (no tokio runtime needed) for reliable
+                // cross-thread delivery.
+                let execute_proxy = self.proxy.clone();
+                std::thread::Builder::new()
+                    .name("mcp-execute-bridge".into())
+                    .spawn(move || {
+                        tracing::debug!("MCP execute bridge thread started");
+                        while let Ok(cmd) = execute_rx.recv() {
+                            tracing::debug!(command = %cmd.command, "Bridge: forwarding execute command to event loop");
+                            if let Err(ref e) = execute_proxy.0.send_event(UserEvent::McpExecute(cmd)) {
+                                tracing::error!("Bridge: failed to send to event loop: {e:?}");
+                            }
+                        }
+                        tracing::debug!("Bridge: execute channel closed, exiting");
+                    })
+                    .expect("Failed to spawn MCP execute bridge");
+
+                let mcp_server = nex_mcp::NextermMcpServer::new(
+                    Arc::clone(&block_store),
+                    Arc::clone(&terminal_state),
+                    execute_tx,
+                );
+
+                // Spawn MCP HTTP server on the pre-allocated port
+                let mcp_port_for_server = mcp_port;
+                std::thread::Builder::new()
+                    .name("mcp-server".into())
+                    .spawn(move || {
+                        let Some(port) = mcp_port_for_server else {
+                            tracing::warn!("No MCP port allocated, MCP server not started");
+                            return;
+                        };
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("Failed to build MCP tokio runtime");
+                        rt.block_on(async {
+                            tracing::info!("MCP server listening on http://127.0.0.1:{port}/mcp");
+
+                            let claude_path = find_claude_cli();
+
+                            // Remove stale registration first (port may have changed)
+                            let _ = tokio::process::Command::new(&claude_path)
+                                .args(["mcp", "remove", "nexterm", "--scope", "user"])
+                                .output()
+                                .await;
+
+                            // Register with new port
+                            let mcp_url = format!("http://127.0.0.1:{port}/mcp");
+                            let register_result = tokio::process::Command::new(&claude_path)
+                                .args(["mcp", "add",
+                                       "--transport", "http",
+                                       "--scope", "user",
+                                       "nexterm",
+                                       &mcp_url])
+                                .output()
+                                .await;
+                            match register_result {
+                                Ok(output) if output.status.success() => {
+                                    tracing::info!("Registered MCP with Claude Code at {mcp_url}");
+                                }
+                                Ok(output) => {
+                                    let stderr = String::from_utf8_lossy(&output.stderr);
+                                    tracing::debug!("Claude Code MCP registration failed: {stderr}");
+                                }
+                                Err(e) => {
+                                    tracing::debug!("claude CLI not found ({e}), skipping MCP auto-registration");
+                                }
+                            }
+
+                            if let Err(e) = mcp_server.start_http(port).await {
+                                tracing::error!("MCP server error: {e}");
+                            }
+                        });
+                    })
+                    .expect("Failed to spawn MCP server thread");
             }
             Err(e) => {
                 tracing::error!("Failed to initialize renderer: {e}");
@@ -294,6 +458,7 @@ impl ApplicationHandler<UserEvent> for App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
+                deregister_mcp();
                 event_loop.exit();
             }
 
@@ -881,12 +1046,70 @@ impl App {
                 window.request_redraw();
             }
         }
+
+        // Update MCP terminal state snapshot
+        if let (Some(ts), Some(mux), Some(store)) =
+            (&self.terminal_state, &self.mux, &self.block_store)
+        {
+            let pane_infos: Vec<nex_mcp::PaneInfo> = mux.panes_in_active_tab().iter().map(|pane| {
+                let recent = store.get_recent(&pane.id, 1);
+                let last_exit = recent.first().and_then(|b| b.exit_code);
+                let cwd = recent.first()
+                    .map(|b| b.cwd.display().to_string())
+                    .unwrap_or_default();
+                nex_mcp::PaneInfo {
+                    id: pane.id.to_string(),
+                    tab_title: mux.tab_titles().iter()
+                        .find(|(_, _, active)| *active)
+                        .map(|(_, title, _)| title.to_string())
+                        .unwrap_or_default(),
+                    cwd,
+                    term_rows: pane.term_size.rows,
+                    term_cols: pane.term_size.cols,
+                    last_exit_code: last_exit,
+                }
+            }).collect();
+
+            let active_id = mux.focused_pane().map(|p| p.id.to_string());
+            let mut state = ts.lock();
+            state.panes = pane_infos;
+            state.active_pane_id = active_id;
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+
+/// Find the Claude CLI binary, checking common install locations.
+fn find_claude_cli() -> std::path::PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    [
+        home.join(".local/bin/claude"),
+        home.join(".claude/bin/claude"),
+        std::path::PathBuf::from("/usr/local/bin/claude"),
+        std::path::PathBuf::from("/opt/homebrew/bin/claude"),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+    .unwrap_or_else(|| std::path::PathBuf::from("claude"))
+}
+
+/// Best-effort MCP deregistration with Claude Code on shutdown.
+fn deregister_mcp() {
+    let claude_path = find_claude_cli();
+
+    match std::process::Command::new(&claude_path)
+        .args(["mcp", "remove", "nexterm", "--scope", "user"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            tracing::info!("Deregistered MCP from Claude Code");
+        }
+        _ => {}
+    }
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();

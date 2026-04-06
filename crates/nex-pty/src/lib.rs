@@ -52,7 +52,7 @@ pub struct NexPty {
 impl NexPty {
     /// Spawn a new PTY with the given shell command.
     /// Automatically injects shell integration for supported shells.
-    pub fn spawn(shell: &str, size: TerminalSize) -> Result<(Self, Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+    pub fn spawn(shell: &str, size: TerminalSize, mcp_port: Option<u16>) -> Result<(Self, Box<dyn Read + Send>, Box<dyn Write + Send>)> {
         let pty_system = native_pty_system();
 
         let pty_size = PtySize {
@@ -69,6 +69,9 @@ impl NexPty {
         let mut cmd = CommandBuilder::new(shell);
         cmd.env("TERM", "xterm-256color");
         cmd.env("NEXTERM", "1");
+        if let Some(port) = mcp_port {
+            cmd.env("NEXTERM_MCP_PORT", port.to_string());
+        }
 
         // Auto-inject shell integration
         if let Ok(integration_dir) = ensure_shell_integration_dir() {
@@ -92,7 +95,9 @@ impl NexPty {
                     // .zshenv: keep ZDOTDIR as wrapper dir (so zsh finds our .zshrc),
                     // but source user's .zshenv from their home.
                     let zshenv = format!(
-                        r#"NEXTERM_USER_ZDOTDIR="{user_zdotdir}"
+                        r#"# Preserve history file — use $HOME which never changes with ZDOTDIR
+HISTFILE="${{HISTFILE:-$HOME/.zsh_history}}"
+NEXTERM_USER_ZDOTDIR="{user_zdotdir}"
 [[ -f "{user_zdotdir}/.zshenv" ]] && ZDOTDIR="{user_zdotdir}" source "{user_zdotdir}/.zshenv"
 "#
                     );

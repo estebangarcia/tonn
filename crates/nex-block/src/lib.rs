@@ -82,11 +82,139 @@ impl BlockStore {
             })
             .unwrap_or_default()
     }
+
+    pub fn search(&self, pattern: &str, max_results: usize) -> Vec<Arc<Block>> {
+        let re = match regex::Regex::new(pattern) {
+            Ok(r) => r,
+            Err(_) => return vec![],
+        };
+        self.blocks
+            .iter()
+            .filter(|e| re.is_match(&e.value().output.stripped_text))
+            .take(max_results)
+            .map(|e| Arc::clone(e.value()))
+            .collect()
+    }
+
+    pub fn get_all_for_pane(&self, pane_id: &PaneId) -> Vec<Arc<Block>> {
+        self.pane_index
+            .get(pane_id)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| self.blocks.get(id).map(|b| Arc::clone(&b)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl Default for BlockStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nex_common::{BlockId, CompressedOutput, OutputClass, PaneId};
+    use std::path::PathBuf;
+
+    fn make_block(pane_id: PaneId, command: &str, output: &str, store: &BlockStore) -> Block {
+        Block {
+            id: BlockId::new(),
+            pane_id,
+            sequence: store.next_sequence(),
+            prompt: String::new(),
+            command: command.to_string(),
+            output: BlockOutput {
+                stripped_text: output.to_string(),
+                compressed: CompressedOutput {
+                    summary: format!("ran {command}"),
+                    key_lines: vec![],
+                    compression_ratio: 1.0,
+                },
+            },
+            exit_code: Some(0),
+            cwd: PathBuf::from("/tmp"),
+            duration: Some(Duration::from_millis(100)),
+            timestamp: Utc::now(),
+            classification: OutputClass::Plain,
+            token_estimate: output.len() / TOKEN_ESTIMATE_DIVISOR,
+        }
+    }
+
+    #[test]
+    fn search_matches_output_regex() {
+        let store = BlockStore::new();
+        let pane = PaneId::new();
+        store.insert(make_block(pane, "ls", "file1.txt\nfile2.rs", &store));
+        store.insert(make_block(pane, "echo", "hello world", &store));
+
+        let results = store.search(r"\.rs$", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].command, "ls");
+    }
+
+    #[test]
+    fn search_invalid_regex_returns_empty() {
+        let store = BlockStore::new();
+        let pane = PaneId::new();
+        store.insert(make_block(pane, "ls", "output", &store));
+
+        let results = store.search(r"[invalid", 10);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_respects_max_results() {
+        let store = BlockStore::new();
+        let pane = PaneId::new();
+        for i in 0..5 {
+            store.insert(make_block(pane, &format!("cmd{i}"), "match_me", &store));
+        }
+
+        let results = store.search("match_me", 3);
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn get_all_for_pane_returns_correct_blocks() {
+        let store = BlockStore::new();
+        let pane_a = PaneId::new();
+        let pane_b = PaneId::new();
+        store.insert(make_block(pane_a, "cmd1", "out1", &store));
+        store.insert(make_block(pane_b, "cmd2", "out2", &store));
+        store.insert(make_block(pane_a, "cmd3", "out3", &store));
+
+        let blocks_a = store.get_all_for_pane(&pane_a);
+        assert_eq!(blocks_a.len(), 2);
+        assert!(blocks_a.iter().all(|b| b.pane_id == pane_a));
+
+        let blocks_b = store.get_all_for_pane(&pane_b);
+        assert_eq!(blocks_b.len(), 1);
+        assert_eq!(blocks_b[0].command, "cmd2");
+    }
+
+    #[test]
+    fn get_all_for_pane_unknown_returns_empty() {
+        let store = BlockStore::new();
+        let unknown = PaneId::new();
+        assert!(store.get_all_for_pane(&unknown).is_empty());
+    }
+
+    #[test]
+    fn get_recent_returns_most_recent_first() {
+        let store = BlockStore::new();
+        let pane = PaneId::new();
+        store.insert(make_block(pane, "first", "out", &store));
+        store.insert(make_block(pane, "second", "out", &store));
+        store.insert(make_block(pane, "third", "out", &store));
+
+        let recent = store.get_recent(&pane, 2);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].command, "third");
+        assert_eq!(recent[1].command, "second");
     }
 }
 

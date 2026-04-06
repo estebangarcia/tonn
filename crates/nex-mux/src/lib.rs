@@ -53,6 +53,7 @@ pub struct Mux {
     font_size: f32,
     scale_factor: f32,
     block_event_tx: Sender<BlockEvent>,
+    mcp_port: Option<u16>,
 }
 
 impl Mux {
@@ -64,17 +65,19 @@ impl Mux {
         scale_factor: f32,
         block_event_tx: Sender<BlockEvent>,
         event_proxy: Proxy,
+        mcp_port: Option<u16>,
     ) -> anyhow::Result<Self> {
         let mut mux = Self {
             panes: HashMap::new(),
             tabs: Vec::new(),
             active_tab: 0,
-            focused_pane: PaneId::new(), // placeholder, overwritten below
+            focused_pane: PaneId::new(),
             zoomed_pane: None,
             shell,
             font_size,
             scale_factor,
             block_event_tx,
+            mcp_port,
         };
 
         let pane_id = mux.spawn_pane(initial_bounds, &event_proxy)?;
@@ -102,6 +105,7 @@ impl Mux {
             bounds,
             self.block_event_tx.clone(),
             event_proxy,
+            self.mcp_port,
         )?;
         let pane_id = pane.id;
         self.panes.insert(pane_id, pane);

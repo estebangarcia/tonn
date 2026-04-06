@@ -8,11 +8,17 @@ license.workspace = true
 [dependencies]
 nex-common = { workspace = true }
 nex-block = { workspace = true }
-nex-ai-session = { workspace = true }
-nex-token-save = { workspace = true }
+rmcp = { workspace = true }
+schemars = { workspace = true }
 tokio = { workspace = true }
-axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+nex-common = { workspace = true }

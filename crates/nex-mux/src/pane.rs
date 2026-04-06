@@ -41,9 +41,10 @@ impl Pane {
         bounds: Rect,
         block_event_tx: Sender<BlockEvent>,
         event_proxy: &Proxy,
+        mcp_port: Option<u16>,
     ) -> anyhow::Result<Self> {
         let pane_id = PaneId::new();
-        let (pty, reader, writer) = NexPty::spawn(shell, size)?;
+        let (pty, reader, writer) = NexPty::spawn(shell, size, mcp_port)?;
         let pty_writer = Arc::new(Mutex::new(writer));
 
         // Channel for PtyWrite events (DSR responses)
@@ -134,18 +135,25 @@ fn io_thread<Proxy: MuxEventProxy>(
             Ok(n) => {
                 let data = &buf[..n];
 
-                // Scan for OSC 133 sequences and emit BlockEvents
+                // Scan for OSC sequences and emit BlockEvents
                 for event in osc_scanner.scan(data) {
-                    shell_state = shell_state.transition(&event);
                     let block_event = match event {
-                        nex_shell_integration::Osc133::PromptStart =>
-                            Some(BlockEvent::PromptStart { pane_id }),
-                        nex_shell_integration::Osc133::CommandStart =>
-                            Some(BlockEvent::CommandStart { pane_id }),
-                        nex_shell_integration::Osc133::ExecutionStart =>
-                            Some(BlockEvent::ExecutionStart { pane_id, command: String::new() }),
-                        nex_shell_integration::Osc133::CommandFinished { exit_code } =>
-                            Some(BlockEvent::CommandFinished { pane_id, exit_code }),
+                        nex_shell_integration::TerminalOscEvent::Osc133(osc) => {
+                            shell_state = shell_state.transition(&osc);
+                            match osc {
+                                nex_shell_integration::Osc133::PromptStart =>
+                                    Some(BlockEvent::PromptStart { pane_id }),
+                                nex_shell_integration::Osc133::CommandStart =>
+                                    Some(BlockEvent::CommandStart { pane_id }),
+                                nex_shell_integration::Osc133::ExecutionStart =>
+                                    Some(BlockEvent::ExecutionStart { pane_id, command: String::new() }),
+                                nex_shell_integration::Osc133::CommandFinished { exit_code } =>
+                                    Some(BlockEvent::CommandFinished { pane_id, exit_code }),
+                            }
+                        }
+                        nex_shell_integration::TerminalOscEvent::CwdChanged(path) => {
+                            Some(BlockEvent::CwdChanged { pane_id, cwd: path.into() })
+                        }
                     };
                     if let Some(evt) = block_event {
                         let _ = block_event_tx.send(evt);

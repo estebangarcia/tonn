@@ -717,6 +717,21 @@ impl Renderer {
             let has_above = scroll_offset > 0;
             let has_below = scroll_offset + visible_count < total;
 
+            // Max chars that fit in the panel (estimate from font size)
+            let overlay_char_w = OVERLAY_FONT_SIZE_LOGICAL * scale * 0.6;
+            let max_label_chars = ((panel_w - OVERLAY_PADDING_LOGICAL * scale * 2.0) / overlay_char_w)
+                .floor().max(10.0) as usize;
+
+            let truncate_label = |label: &str, suffix: &str| -> String {
+                let budget = max_label_chars.saturating_sub(suffix.len());
+                if label.chars().count() > budget && budget > 4 {
+                    let truncated: String = label.chars().take(budget - 1).collect();
+                    format!("{truncated}…{suffix}")
+                } else {
+                    format!("{label}{suffix}")
+                }
+            };
+
             let mut spans: Vec<(String, bool)> = Vec::new();
             for vi in 0..visible_count {
                 let entry_idx = scroll_offset + vi;
@@ -724,24 +739,17 @@ impl Renderer {
                 if vi > 0 {
                     spans.push(("\n".to_string(), false));
                 }
-                // Show scroll indicators in first/last entry slots
-                if vi == 0 && has_above {
-                    let prefix = if entry.is_active { " ● " } else { "   " };
-                    spans.push((
-                        format!("{prefix}{}  ↑{}", entry.label, scroll_offset),
-                        entry_idx == overlay.selected_index,
-                    ));
+                let prefix = if entry.is_active { " ● " } else { "   " };
+                let prefixed = format!("{prefix}{}", entry.label);
+                let text = if vi == 0 && has_above {
+                    truncate_label(&prefixed, &format!(" ↑{scroll_offset}"))
                 } else if vi == visible_count - 1 && has_below {
                     let below = total - scroll_offset - visible_count;
-                    let prefix = if entry.is_active { " ● " } else { "   " };
-                    spans.push((
-                        format!("{prefix}{}  ↓{}", entry.label, below),
-                        entry_idx == overlay.selected_index,
-                    ));
+                    truncate_label(&prefixed, &format!(" ↓{below}"))
                 } else {
-                    let prefix = if entry.is_active { " ● " } else { "   " };
-                    spans.push((format!("{prefix}{}", entry.label), entry_idx == overlay.selected_index));
-                }
+                    truncate_label(&prefixed, "")
+                };
+                spans.push((text, entry_idx == overlay.selected_index));
             }
 
             let rich_spans: Vec<(&str, Attrs)> = spans.iter().map(|(text, is_selected)| {
