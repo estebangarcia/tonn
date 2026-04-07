@@ -1,3 +1,9 @@
+## [1.0.2](https://github.com/estebangarcia/tonn/compare/v1.0.1...v1.0.2) (2026-04-07)
+
+### Bug Fixes
+
+* make sure macOS bundles source profiles correctly ([57c31b2](https://github.com/estebangarcia/tonn/commit/57c31b2354e8fe8dd32aa718a28cbba2eb36bb1d))
+
 ## [1.0.1](https://github.com/estebangarcia/tonn/compare/v1.0.0...v1.0.1) (2026-04-07)
 
 ### Bug Fixes
