@@ -43,6 +43,21 @@ fn shell_type(shell: &str) -> &'static str {
     }
 }
 
+/// Returns true when Tonn is running inside a macOS .app bundle,
+/// which means it was launched from Finder/Dock with a minimal PATH.
+fn launched_from_app_bundle() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        std::env::current_exe()
+            .map(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// A managed PTY instance.
 pub struct NexPty {
     master: Box<dyn MasterPty + Send>,
@@ -73,6 +88,11 @@ impl NexPty {
         if let Some(port) = mcp_port {
             cmd.env("TONN_MCP_PORT", port.to_string());
         }
+
+        // On macOS, when launched from .app bundle, the shell inherits
+        // launchd's minimal PATH. Launch as login shell so .zprofile /
+        // .bash_profile are sourced to get the full PATH.
+        let login_shell = launched_from_app_bundle();
 
         // Auto-inject shell integration
         if let Ok(integration_dir) = ensure_shell_integration_dir() {
@@ -113,14 +133,41 @@ source "{script_path}/tonn.zsh"
 "#
                     );
                     std::fs::write(zdotdir.join(".zshrc"), zshrc).ok();
+
+                    // Forward .zprofile and .zlogin so login shells get
+                    // the user's PATH setup even with ZDOTDIR redirected.
+                    let zprofile = format!(
+                        r#"[[ -f "{user_zdotdir}/.zprofile" ]] && ZDOTDIR="{user_zdotdir}" source "{user_zdotdir}/.zprofile"
+"#
+                    );
+                    std::fs::write(zdotdir.join(".zprofile"), zprofile).ok();
+
+                    let zlogin = format!(
+                        r#"[[ -f "{user_zdotdir}/.zlogin" ]] && ZDOTDIR="{user_zdotdir}" source "{user_zdotdir}/.zlogin"
+"#
+                    );
+                    std::fs::write(zdotdir.join(".zlogin"), zlogin).ok();
+
                     cmd.env("ZDOTDIR", zdotdir.display().to_string());
                     cmd.env("TONN_USER_ZDOTDIR", &user_zdotdir);
+                    if login_shell {
+                        cmd.arg("-l");
+                    }
                 }
                 "bash" => {
-                    // Bash: use --rcfile or ENV to source our integration after .bashrc
+                    // Bash: use --rcfile to source our integration after .bashrc.
+                    // Can't use -l with --rcfile (bash ignores --rcfile in login mode),
+                    // so for .app launches we source login profile files in the wrapper.
                     let rcfile = integration_dir.join("bash_init.sh");
                     let wrapper = format!(
                         r#"# Tonn auto-injected wrapper
+if [[ -n "$TONN_LOGIN" ]]; then
+    [[ -f /etc/profile ]] && source /etc/profile
+    for f in ~/.bash_profile ~/.bash_login ~/.profile; do
+        [[ -f "$f" ]] && source "$f" && break
+    done
+    unset TONN_LOGIN
+fi
 if [[ -f ~/.bashrc ]]; then
     source ~/.bashrc
 fi
@@ -129,11 +176,17 @@ source "{script_path}/tonn.bash"
                     );
                     std::fs::write(&rcfile, wrapper).ok();
                     cmd.args(["--rcfile", &rcfile.display().to_string()]);
+                    if login_shell {
+                        cmd.env("TONN_LOGIN", "1");
+                    }
                 }
                 "fish" => {
                     // Fish: use --init-command
                     let init = format!("source {script_path}/tonn.fish");
                     cmd.args(["--init-command", &init]);
+                    if login_shell {
+                        cmd.arg("-l");
+                    }
                 }
                 _ => {}
             }
