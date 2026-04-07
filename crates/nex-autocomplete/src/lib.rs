@@ -1,2 +1,2 @@
-//! AI-powered shell autocomplete for Nexterm.
+//! AI-powered shell autocomplete for Tonn.
 //! Phase 0 stub - full implementation in Phase 5.

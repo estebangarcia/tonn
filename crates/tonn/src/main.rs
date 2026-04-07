@@ -1,4 +1,4 @@
-//! Nexterm - AI-First Terminal Emulator
+//! Tonn - AI-First Terminal Emulator
 //!
 //! Main binary: winit event loop + wgpu rendering + mux-managed panes.
 
@@ -16,10 +16,10 @@ use winit::window::{Window, WindowId};
 
 use nex_common::{PaneId, CELL_WIDTH_RATIO, LINE_HEIGHT_RATIO, PADDING};
 use nex_mux::{Mux, MuxEventProxy, Rect, SplitDirection, DEFAULT_TAB_TITLE};
-use nex_render::renderer::{BgCell, PaneContent, Renderer, RenderSpan, SelectionCell, DEFAULT_FONT_SIZE, FONT_SIZE_STEP};
+use nex_render::renderer::{BgCell, PaneContent, Renderer, RenderSpan, SelectionCell, SettingsFieldType, DEFAULT_FONT_SIZE, FONT_SIZE_STEP};
 
 // UI constants
-const APP_TITLE: &str = "Nexterm";
+const APP_TITLE: &str = "Tonn";
 const TAB_BAR_HEIGHT_LOGICAL: f32 = 28.0;
 const BELL_FLASH_DURATION_MS: u64 = 150;
 const DEFAULT_WINDOW_WIDTH: u32 = 960;
@@ -88,7 +88,7 @@ impl MuxEventProxy for WinitProxy {
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(name = "nexterm", about = "AI-First Terminal Emulator")]
+#[command(name = "tonn", about = "AI-First Terminal Emulator")]
 struct Cli {
     #[arg(short, long)]
     shell: Option<String>,
@@ -110,7 +110,7 @@ const SESSION_FILTER_ACTIVE: &str = "Active";
 
 struct SessionBrowser {
     trees: Vec<nex_ai_session::SessionTree>,
-    nexterm_active_ids: Vec<String>,
+    tonn_active_ids: Vec<String>,
     tool_names: Vec<String>,        // provider names from registered providers
     selected_tab: usize,            // 0=All, 1..N=tool, N+1=Active
     display_entries: Vec<DisplayEntry>,
@@ -132,14 +132,14 @@ enum DisplayEntryKind {
 impl SessionBrowser {
     fn new(
         trees: Vec<nex_ai_session::SessionTree>,
-        nexterm_active_ids: Vec<String>,
+        tonn_active_ids: Vec<String>,
         tool_names: Vec<String>,
     ) -> Self {
         let expanded_projects: std::collections::HashSet<String> =
             trees.iter().map(|t| t.project_name.clone()).collect();
         let mut browser = Self {
             trees,
-            nexterm_active_ids,
+            tonn_active_ids,
             tool_names,
             selected_tab: 0,
             display_entries: Vec::new(),
@@ -202,7 +202,7 @@ impl SessionBrowser {
                             return false;
                         }
                     }
-                    if self.active_only && !self.is_active_in_nexterm(&f.session.id) {
+                    if self.active_only && !self.is_active_in_tonn(&f.session.id) {
                         return false;
                     }
                     if query.is_empty() {
@@ -300,13 +300,147 @@ impl SessionBrowser {
         })
     }
 
-    fn is_active_in_nexterm(&self, session_id: &str) -> bool {
-        self.nexterm_active_ids.iter().any(|id| id == session_id)
+    fn is_active_in_tonn(&self, session_id: &str) -> bool {
+        self.tonn_active_ids.iter().any(|id| id == session_id)
+    }
+}
+
+struct SelectPicker {
+    options: Vec<String>,
+    filtered: Vec<usize>,
+    selected: usize,
+    filter: String,
+    target_key: String,
+    original_value: String,
+}
+
+impl SelectPicker {
+    fn new(options: Vec<String>, target_key: String, current_value: String) -> Self {
+        let filtered: Vec<usize> = (0..options.len()).collect();
+        let selected = options.iter().position(|o| o == &current_value).unwrap_or(0);
+        Self { options, filtered, selected, filter: String::new(), target_key, original_value: current_value }
+    }
+
+    fn apply_filter(&mut self) {
+        let query = self.filter.to_lowercase();
+        self.filtered = if query.is_empty() {
+            (0..self.options.len()).collect()
+        } else {
+            self.options.iter().enumerate()
+                .filter(|(_, o)| o.to_lowercase().contains(&query))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        if self.selected >= self.filtered.len() {
+            self.selected = self.filtered.len().saturating_sub(1);
+        }
+    }
+
+    fn selected_option(&self) -> Option<&str> {
+        self.filtered.get(self.selected)
+            .and_then(|&idx| self.options.get(idx))
+            .map(|s| s.as_str())
+    }
+}
+
+struct SettingsPanel {
+    config: nex_config::TonnConfig,
+    #[allow(dead_code)]
+    original: nex_config::TonnConfig,
+    fields: Vec<SettingItem>,
+    selected: usize,
+    editing: bool,
+    edit_buffer: String,
+    picker: Option<SelectPicker>,
+}
+
+struct SettingItem {
+    section: String,
+    label: String,
+    key: String,
+    field_type: SettingsFieldType,
+}
+
+fn build_settings_fields(font_families: Vec<String>) -> Vec<SettingItem> {
+    vec![
+        SettingItem { section: "General".to_string(), label: "Shell".to_string(), key: "general.shell".to_string(), field_type: SettingsFieldType::Text },
+        SettingItem { section: "General".to_string(), label: "Font".to_string(), key: "general.font_family".to_string(), field_type: SettingsFieldType::Select(font_families) },
+        SettingItem { section: "General".to_string(), label: "Font Size".to_string(), key: "general.font_size".to_string(), field_type: SettingsFieldType::Number },
+        SettingItem { section: "General".to_string(), label: "Theme".to_string(), key: "general.theme".to_string(), field_type: SettingsFieldType::Select(nex_config::AVAILABLE_THEMES.iter().map(|s| s.to_string()).collect()) },
+        SettingItem { section: "General".to_string(), label: "Auto Update".to_string(), key: "general.auto_update".to_string(), field_type: SettingsFieldType::Toggle },
+        SettingItem { section: "Terminal".to_string(), label: "Scrollback".to_string(), key: "general.scrollback_history".to_string(), field_type: SettingsFieldType::Number },
+        SettingItem { section: "MCP Server".to_string(), label: "Enabled".to_string(), key: "mcp.enabled".to_string(), field_type: SettingsFieldType::Toggle },
+    ]
+}
+
+impl SettingsPanel {
+    fn new(config: nex_config::TonnConfig, font_families: Vec<String>) -> Self {
+        Self {
+            original: config.clone(),
+            config,
+            fields: build_settings_fields(font_families),
+            selected: 0,
+            editing: false,
+            edit_buffer: String::new(),
+            picker: None,
+        }
+    }
+
+    fn get_value(&self, key: &str) -> String {
+        match key {
+            "general.shell" => self.config.general.shell.clone().unwrap_or_default(),
+            "general.font_family" => {
+                if self.config.general.font_family.is_empty() {
+                    "System Default (Monospace)".to_string()
+                } else {
+                    self.config.general.font_family.clone()
+                }
+            }
+            "general.font_size" => self.config.general.font_size.to_string(),
+            "general.theme" => self.config.general.theme.clone(),
+            "general.auto_update" => if self.config.general.auto_update { "On" } else { "Off" }.to_string(),
+            "general.scrollback_history" => self.config.general.scrollback_history.to_string(),
+            "mcp.enabled" => if self.config.mcp.enabled { "On" } else { "Off" }.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn set_value(&mut self, key: &str, value: &str) {
+        match key {
+            "general.shell" => self.config.general.shell = if value.is_empty() { None } else { Some(value.to_string()) },
+            "general.font_family" => {
+                self.config.general.font_family = if value.starts_with("System Default") {
+                    String::new()
+                } else {
+                    value.to_string()
+                };
+            }
+            "general.font_size" => if let Ok(v) = value.parse() { self.config.general.font_size = v; },
+            "general.theme" => self.config.general.theme = value.to_string(),
+            "general.auto_update" => self.config.general.auto_update = value == "On",
+            "general.scrollback_history" => if let Ok(v) = value.parse() { self.config.general.scrollback_history = v; },
+            "mcp.enabled" => self.config.mcp.enabled = value == "On",
+            _ => {}
+        }
+    }
+
+    fn total_fields(&self) -> usize {
+        self.fields.len()
+    }
+}
+
+fn save_config(config: &nex_config::TonnConfig) {
+    let dir = nex_config::config_dir();
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join("config.toml");
+    if let Ok(toml_str) = toml::to_string_pretty(config) {
+        std::fs::write(&path, toml_str).ok();
     }
 }
 
 struct App {
     shell: String,
+    config: nex_config::TonnConfig,
     proxy: WinitProxy,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -317,6 +451,7 @@ struct App {
     bell_flash_until: Option<std::time::Instant>,
     tab_switcher: Option<TabSwitcher>,
     session_browser: Option<SessionBrowser>,
+    settings_panel: Option<SettingsPanel>,
     session_manager: Option<Arc<nex_ai_session::SessionManager>>,
     last_tab_count: usize,
     last_active_tab: usize,
@@ -327,9 +462,10 @@ struct App {
 }
 
 impl App {
-    fn new(shell: String, proxy: WinitProxy) -> Self {
+    fn new(shell: String, config: nex_config::TonnConfig, proxy: WinitProxy) -> Self {
         Self {
             shell,
+            config,
             proxy,
             window: None,
             renderer: None,
@@ -340,6 +476,7 @@ impl App {
             bell_flash_until: None,
             tab_switcher: None,
             session_browser: None,
+            settings_panel: None,
             session_manager: None,
             last_tab_count: 1,
             last_active_tab: 0,
@@ -526,7 +663,13 @@ impl ApplicationHandler<UserEvent> for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("Failed to create window"));
         self.window = Some(Arc::clone(&window));
 
-        let renderer = pollster::block_on(Renderer::new(Arc::clone(&window)));
+        let theme = self.config.theme();
+        let renderer = pollster::block_on(Renderer::new(
+            Arc::clone(&window),
+            theme,
+            self.config.general.font_family.clone(),
+            self.config.general.font_size,
+        ));
         match renderer {
             Ok(r) => {
                 self.renderer = Some(r);
@@ -535,7 +678,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 let (block_tx, block_rx) = nex_ipc::block_channel();
 
-                // Pre-allocate MCP port so PTY shells get NEXTERM_MCP_PORT
+                // Pre-allocate MCP port so PTY shells get TONN_MCP_PORT
                 let mcp_port = std::net::TcpListener::bind("127.0.0.1:0")
                     .ok()
                     .and_then(|l| l.local_addr().ok())
@@ -559,6 +702,7 @@ impl ApplicationHandler<UserEvent> for App {
                     block_tx,
                     self.proxy.clone(),
                     mcp_port,
+                    self.config.general.scrollback_history,
                 )
                 .expect("Failed to create mux");
 
@@ -610,7 +754,7 @@ impl ApplicationHandler<UserEvent> for App {
                     })
                     .expect("Failed to spawn MCP execute bridge");
 
-                let mcp_server = nex_mcp::NextermMcpServer::new(
+                let mcp_server = nex_mcp::TonnMcpServer::new(
                     Arc::clone(&block_store),
                     Arc::clone(&terminal_state),
                     execute_tx,
@@ -637,7 +781,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                             // Remove stale registration first (port may have changed)
                             let _ = tokio::process::Command::new(&claude_path)
-                                .args(["mcp", "remove", "nexterm", "--scope", "user"])
+                                .args(["mcp", "remove", "tonn", "--scope", "user"])
                                 .output()
                                 .await;
 
@@ -647,7 +791,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 .args(["mcp", "add",
                                        "--transport", "http",
                                        "--scope", "user",
-                                       "nexterm",
+                                       "tonn",
                                        &mcp_url])
                                 .output()
                                 .await;
@@ -844,6 +988,34 @@ impl App {
         let ctrl = self.modifiers.state().control_key();
         let super_key = self.modifiers.state().super_key();
         let shift = self.modifiers.state().shift_key();
+
+        // --- Settings panel (Cmd+,) ---
+        if super_key && matches!(logical_key, Key::Character(c) if c.as_str() == ",") {
+            if self.settings_panel.is_some() {
+                if let Some(panel) = self.settings_panel.take() {
+                    save_config(&panel.config);
+                    self.config = panel.config;
+                }
+            } else {
+                let font_families = self.renderer.as_ref()
+                    .map(|r| r.list_font_families())
+                    .unwrap_or_default();
+                self.settings_panel = Some(SettingsPanel::new(self.config.clone(), font_families));
+            }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return;
+        }
+
+        // Settings panel navigation (when open)
+        if self.settings_panel.is_some() {
+            self.handle_settings_key(logical_key, text, ctrl, super_key);
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return;
+        }
 
         // --- Session browser (Cmd+Shift+P) ---
         if super_key && shift && matches!(logical_key, Key::Character(c) if c.as_str() == "p" || c.as_str() == "P") {
@@ -1223,6 +1395,224 @@ impl App {
 }
 
 // ---------------------------------------------------------------------------
+// Settings panel
+// ---------------------------------------------------------------------------
+
+impl App {
+    fn handle_settings_key(&mut self, logical_key: &Key, text: Option<&str>, ctrl: bool, super_key: bool) {
+        // When picker is open, route all keys to picker
+        let picker_open = self.settings_panel.as_ref().map_or(false, |p| p.picker.is_some());
+        if picker_open {
+            self.handle_picker_key(logical_key, text, ctrl, super_key);
+            return;
+        }
+
+        match logical_key {
+            Key::Named(NamedKey::Escape) => {
+                let editing = self.settings_panel.as_ref().map_or(false, |p| p.editing);
+                if editing {
+                    let panel = self.settings_panel.as_mut().unwrap();
+                    panel.editing = false;
+                    panel.edit_buffer.clear();
+                } else if let Some(panel) = self.settings_panel.take() {
+                    save_config(&panel.config);
+                    self.config = panel.config;
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                let panel = self.settings_panel.as_mut().unwrap();
+                if !panel.editing && panel.selected > 0 {
+                    panel.selected -= 1;
+                }
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                let panel = self.settings_panel.as_mut().unwrap();
+                if !panel.editing && panel.selected + 1 < panel.total_fields() {
+                    panel.selected += 1;
+                }
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.handle_settings_enter();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(panel) = self.settings_panel.as_mut() {
+                    if panel.editing {
+                        panel.edit_buffer.pop();
+                    }
+                }
+            }
+            _ => {
+                if let Some(panel) = self.settings_panel.as_mut() {
+                    if panel.editing {
+                        if let Some(text) = text {
+                            if !ctrl && !super_key {
+                                panel.edit_buffer.push_str(text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_picker_key(&mut self, logical_key: &Key, text: Option<&str>, ctrl: bool, super_key: bool) {
+        let panel = self.settings_panel.as_mut().unwrap();
+        let picker = panel.picker.as_mut().unwrap();
+
+        match logical_key {
+            Key::Named(NamedKey::Escape) => {
+                let original = picker.original_value.clone();
+                let target = picker.target_key.clone();
+                panel.picker = None;
+                panel.set_value(&target, &original);
+                self.apply_settings_preview(&target);
+            }
+            Key::Named(NamedKey::Enter) => {
+                if let Some(option) = picker.selected_option() {
+                    let value = option.to_string();
+                    let target = picker.target_key.clone();
+                    panel.picker = None;
+                    panel.set_value(&target, &value);
+                    self.apply_settings_preview(&target);
+                } else {
+                    panel.picker = None;
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if picker.selected > 0 {
+                    picker.selected -= 1;
+                }
+                // Live preview
+                if let Some(option) = picker.selected_option() {
+                    let value = option.to_string();
+                    let target = picker.target_key.clone();
+                    panel.set_value(&target, &value);
+                    self.apply_settings_preview(&target);
+                }
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if picker.selected + 1 < picker.filtered.len() {
+                    picker.selected += 1;
+                }
+                // Live preview
+                if let Some(option) = picker.selected_option() {
+                    let value = option.to_string();
+                    let target = picker.target_key.clone();
+                    panel.set_value(&target, &value);
+                    self.apply_settings_preview(&target);
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                picker.filter.pop();
+                picker.apply_filter();
+                // Live preview
+                if let Some(option) = picker.selected_option() {
+                    let value = option.to_string();
+                    let target = picker.target_key.clone();
+                    panel.set_value(&target, &value);
+                    self.apply_settings_preview(&target);
+                }
+            }
+            _ => {
+                if let Some(text) = text {
+                    if !ctrl && !super_key {
+                        picker.filter.push_str(text);
+                        picker.apply_filter();
+                        // Live preview
+                        if let Some(option) = picker.selected_option() {
+                            let value = option.to_string();
+                            let target = picker.target_key.clone();
+                            panel.set_value(&target, &value);
+                            self.apply_settings_preview(&target);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_settings_enter(&mut self) {
+        let (key, field_type, editing, edit_value) = {
+            let panel = self.settings_panel.as_ref().unwrap();
+            let item = &panel.fields[panel.selected];
+            (
+                item.key.clone(),
+                item.field_type.clone(),
+                panel.editing,
+                panel.edit_buffer.clone(),
+            )
+        };
+
+        if editing {
+            {
+                let panel = self.settings_panel.as_mut().unwrap();
+                panel.set_value(&key, &edit_value);
+                panel.editing = false;
+                panel.edit_buffer.clear();
+            }
+            self.apply_settings_preview(&key);
+        } else {
+            match field_type {
+                SettingsFieldType::Toggle => {
+                    let panel = self.settings_panel.as_mut().unwrap();
+                    let current = panel.get_value(&key);
+                    let new_val = if current == "On" { "Off" } else { "On" };
+                    panel.set_value(&key, new_val);
+                }
+                SettingsFieldType::Select(ref opts) => {
+                    let current = {
+                        let panel = self.settings_panel.as_ref().unwrap();
+                        panel.get_value(&key)
+                    };
+                    let panel = self.settings_panel.as_mut().unwrap();
+                    panel.picker = Some(SelectPicker::new(opts.clone(), key.clone(), current));
+                }
+                _ => {
+                    let panel = self.settings_panel.as_mut().unwrap();
+                    panel.editing = true;
+                    panel.edit_buffer = panel.get_value(&key);
+                }
+            }
+        }
+    }
+
+    fn apply_settings_preview(&mut self, key: &str) {
+        let (theme, font_family, font_size) = {
+            let Some(panel) = &self.settings_panel else { return; };
+            (
+                panel.config.theme(),
+                panel.config.general.font_family.clone(),
+                panel.config.general.font_size,
+            )
+        };
+        match key {
+            "general.theme" => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_theme(theme);
+                }
+            }
+            "general.font_family" => {
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_font_family(font_family);
+                }
+            }
+            "general.font_size" => {
+                if let Some(renderer) = &mut self.renderer {
+                    if renderer.set_font_size(font_size) {
+                        if let Some(mux) = &mut self.mux {
+                            mux.update_font(renderer.font_size(), renderer.scale_factor());
+                            let area = Self::pane_area(self.renderer.as_ref().unwrap(), mux.tab_count());
+                            mux.recalculate_bounds(area);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session resume
 // ---------------------------------------------------------------------------
 
@@ -1310,9 +1700,13 @@ impl App {
         }
 
         // Build content for each pane in the active tab
+        let theme = self.renderer.as_ref().unwrap().theme();
+        let ansi_palette = theme.ansi_palette();
+        let theme_fg = theme.fg;
+        let theme_bg = theme.bg;
         let pane_contents: Vec<PaneContent> = mux.panes_in_active_tab().iter().map(|pane| {
             let term = pane.terminal.lock();
-            let content = read_grid_content(&term);
+            let content = read_grid_content(&term, &ansi_palette, theme_fg, theme_bg);
 
             let spans = content.spans.iter().map(|s| RenderSpan {
                 text: s.text.clone(),
@@ -1484,7 +1878,7 @@ impl App {
                                 time_ago: format_time_ago(s.updated_at),
                                 message_count: s.message_count,
                                 model: s.model.clone().unwrap_or_default(),
-                                is_active: browser.is_active_in_nexterm(&s.id),
+                                is_active: browser.is_active_in_tonn(&s.id),
                                 depth: flat_entry.depth,
                                 tree_prefix,
                             }
@@ -1503,7 +1897,60 @@ impl App {
             }
         });
 
-        if let Err(e) = renderer.render_frame(visible_tabs, tab_h, &pane_contents, &divider_lines, overlay.as_ref(), session_overlay.as_ref()) {
+        // Build settings overlay if active
+        let settings_overlay = self.settings_panel.as_ref().map(|panel| {
+            let mut sections: Vec<nex_render::renderer::SettingsSection> = Vec::new();
+            let mut current_section_title = String::new();
+            let mut current_fields: Vec<nex_render::renderer::SettingsField> = Vec::new();
+
+            for item in &panel.fields {
+                if item.section != current_section_title {
+                    if !current_section_title.is_empty() {
+                        sections.push(nex_render::renderer::SettingsSection {
+                            title: current_section_title.clone(),
+                            fields: std::mem::take(&mut current_fields),
+                        });
+                    }
+                    current_section_title = item.section.clone();
+                }
+                current_fields.push(nex_render::renderer::SettingsField {
+                    label: item.label.clone(),
+                    value: panel.get_value(&item.key),
+                    field_type: item.field_type.clone(),
+                });
+            }
+            if !current_section_title.is_empty() {
+                sections.push(nex_render::renderer::SettingsSection {
+                    title: current_section_title,
+                    fields: current_fields,
+                });
+            }
+
+            nex_render::renderer::SettingsOverlay {
+                sections,
+                selected_row: panel.selected,
+                editing: panel.editing,
+                edit_value: panel.edit_buffer.clone(),
+                picker: panel.picker.as_ref().map(|picker| {
+                    let field_label = panel.fields.iter()
+                        .find(|f| f.key == picker.target_key)
+                        .map(|f| f.label.clone())
+                        .unwrap_or_else(|| "Select".to_string());
+                    nex_render::renderer::PickerOverlay {
+                        title: format!("Select {field_label}"),
+                        entries: picker.filtered.iter().map(|&idx| {
+                            let label = picker.options[idx].clone();
+                            let is_current = label == picker.original_value;
+                            nex_render::renderer::PickerEntry { label, is_current }
+                        }).collect(),
+                        selected_index: picker.selected,
+                        filter: picker.filter.clone(),
+                    }
+                }),
+            }
+        });
+
+        if let Err(e) = renderer.render_frame(visible_tabs, tab_h, &pane_contents, &divider_lines, overlay.as_ref(), session_overlay.as_ref(), settings_overlay.as_ref()) {
             tracing::error!("Render error: {e}");
         }
 
@@ -1587,7 +2034,7 @@ fn deregister_mcp() {
     let claude_path = find_claude_cli();
 
     match std::process::Command::new(&claude_path)
-        .args(["mcp", "remove", "nexterm", "--scope", "user"])
+        .args(["mcp", "remove", "tonn", "--scope", "user"])
         .output()
     {
         Ok(output) if output.status.success() => {
@@ -1601,16 +2048,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let filter = if cli.verbose {
-        "nexterm=debug,nex_render=debug,nex_pty=debug,nex_mux=debug,nex_block=debug,nex_shell_integration=debug"
+        "tonn=debug,nex_render=debug,nex_pty=debug,nex_mux=debug,nex_block=debug,nex_shell_integration=debug"
     } else {
-        "nexterm=info"
+        "tonn=info"
     };
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()))
         .init();
 
-    tracing::info!("Starting Nexterm v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("Starting Tonn v{}", env!("CARGO_PKG_VERSION"));
 
     let config = nex_config::load_config();
     let shell = cli.shell
@@ -1623,7 +2070,7 @@ fn main() -> Result<()> {
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
 
     let proxy = WinitProxy(event_loop.create_proxy());
-    let mut app = App::new(shell, proxy);
+    let mut app = App::new(shell, config, proxy);
     event_loop.run_app(&mut app)?;
 
     Ok(())

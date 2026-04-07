@@ -1,4 +1,4 @@
-//! AI session discovery and management for Nexterm.
+//! AI session discovery and management for Tonn.
 //!
 //! Provides a trait-based provider pattern (`AiToolProvider`) so that multiple
 //! AI tools (Claude Code, Cursor, etc.) can be plugged into a single

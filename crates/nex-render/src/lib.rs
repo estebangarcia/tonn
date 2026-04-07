@@ -1,3 +1,3 @@
-//! GPU-accelerated renderer for Nexterm using wgpu + glyphon.
+//! GPU-accelerated renderer for Tonn using wgpu + glyphon.
 
 pub mod renderer;

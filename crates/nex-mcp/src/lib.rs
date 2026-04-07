@@ -1,4 +1,4 @@
-//! Built-in MCP server for Nexterm.
+//! Built-in MCP server for Tonn.
 //!
 //! Exposes terminal state, command blocks, and execution to AI tools
 //! via the Model Context Protocol over streamable HTTP.
@@ -25,10 +25,10 @@ use uuid::Uuid;
 const DEFAULT_RECENT_COUNT: u32 = 10;
 const DEFAULT_SEARCH_MAX_RESULTS: u32 = 20;
 const EXECUTE_CHANNEL_TIMEOUT_SECS: u64 = 30;
-const MCP_SERVER_NAME: &str = "nexterm-mcp";
+const MCP_SERVER_NAME: &str = "tonn-mcp";
 const MCP_SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MCP_INSTRUCTIONS: &str = "\
-You are connected to Nexterm, an AI-first terminal. Workflow: \
+You are connected to Tonn, an AI-first terminal. Workflow: \
 1) Use get_context for working directory and terminal state — don't run pwd/git status. \
 2) Use get_recent_blocks to see what commands already ran — don't re-run them. \
 3) To see more detail on a command's output, call get_block with the block ID and tier='classified' (key lines) or tier='raw' (full output). \
@@ -250,17 +250,17 @@ fn block_by_tier(block: &Block, tier: &str) -> String {
 // MCP server
 // ---------------------------------------------------------------------------
 
-/// The Nexterm MCP server. Exposes terminal blocks, context, and execution.
+/// The Tonn MCP server. Exposes terminal blocks, context, and execution.
 #[derive(Clone)]
-pub struct NextermMcpServer {
+pub struct TonnMcpServer {
     block_store: Arc<BlockStore>,
     terminal_state: Arc<Mutex<TerminalStateSnapshot>>,
     execute_tx: ExecuteSender,
     session_manager: Arc<SessionManager>,
-    tool_router: ToolRouter<NextermMcpServer>,
+    tool_router: ToolRouter<TonnMcpServer>,
 }
 
-impl NextermMcpServer {
+impl TonnMcpServer {
     pub fn new(
         block_store: Arc<BlockStore>,
         terminal_state: Arc<Mutex<TerminalStateSnapshot>>,
@@ -296,7 +296,7 @@ impl NextermMcpServer {
 }
 
 #[tool_router]
-impl NextermMcpServer {
+impl TonnMcpServer {
     /// Retrieve recent command blocks from the terminal history.
     /// Use this before re-running commands to avoid duplication.
     #[tool(
@@ -485,7 +485,7 @@ impl NextermMcpServer {
 }
 
 #[tool_handler]
-impl ServerHandler for NextermMcpServer {
+impl ServerHandler for TonnMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -585,7 +585,7 @@ mod tests {
     }
 }
 
-impl NextermMcpServer {
+impl TonnMcpServer {
     /// Start the MCP server on the given HTTP port using streamable HTTP transport.
     pub async fn start_http(self, port: u16) -> anyhow::Result<()> {
         use rmcp::transport::streamable_http_server::{
@@ -605,7 +605,7 @@ impl NextermMcpServer {
         let app = axum::Router::new().nest_service("/mcp", service);
 
         let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
-        tracing::info!(port, "Nexterm MCP server listening");
+        tracing::info!(port, "Tonn MCP server listening");
         axum::serve(listener, app).await?;
 
         Ok(())

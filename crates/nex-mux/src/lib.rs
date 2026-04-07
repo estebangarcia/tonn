@@ -1,4 +1,4 @@
-//! Built-in terminal multiplexer for Nexterm.
+//! Built-in terminal multiplexer for Tonn.
 //!
 //! Manages tabs, panes (splits), and their associated PTY + terminal instances.
 //! Each pane owns a PTY process and a VT emulator (alacritty_terminal::Term).
@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 
 pub const DEFAULT_TAB_TITLE: &str = "Terminal";
 
-/// Tracks an AI session running in a Nexterm pane.
+/// Tracks an AI session running in a Tonn pane.
 #[derive(Debug, Clone)]
 pub struct ActiveSession {
     pub tab_index: usize,
@@ -62,6 +62,7 @@ pub struct Mux {
     scale_factor: f32,
     block_event_tx: Sender<BlockEvent>,
     mcp_port: Option<u16>,
+    scrollback_history: usize,
     /// Maps AI session IDs to (tab_index, pane_id, initial_block_count).
     /// The block count at resume time lets us detect when the command finishes.
     active_sessions: HashMap<String, ActiveSession>,
@@ -77,6 +78,7 @@ impl Mux {
         block_event_tx: Sender<BlockEvent>,
         event_proxy: Proxy,
         mcp_port: Option<u16>,
+        scrollback_history: usize,
     ) -> anyhow::Result<Self> {
         let mut mux = Self {
             panes: HashMap::new(),
@@ -89,6 +91,7 @@ impl Mux {
             scale_factor,
             block_event_tx,
             mcp_port,
+            scrollback_history,
             active_sessions: HashMap::new(),
         };
 
@@ -118,6 +121,7 @@ impl Mux {
             self.block_event_tx.clone(),
             event_proxy,
             self.mcp_port,
+            self.scrollback_history,
         )?;
         let pane_id = pane.id;
         self.panes.insert(pane_id, pane);

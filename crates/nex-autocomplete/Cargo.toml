@@ -1,6 +1,6 @@
 [package]
 name = "nex-autocomplete"
-description = "AI-powered shell autocomplete for Nexterm"
+description = "AI-powered shell autocomplete for Tonn"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

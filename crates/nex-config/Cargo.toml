@@ -1,6 +1,6 @@
 [package]
 name = "nex-config"
-description = "Configuration management for Nexterm"
+description = "Configuration management for Tonn"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

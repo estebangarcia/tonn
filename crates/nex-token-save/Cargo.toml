@@ -1,6 +1,6 @@
 [package]
 name = "nex-token-save"
-description = "Token-saving output compression pipeline for Nexterm"
+description = "Token-saving output compression pipeline for Tonn"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "nex-block"
-description = "Block model for command-output pairs in Nexterm"
+description = "Block model for command-output pairs in Tonn"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

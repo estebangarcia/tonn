@@ -1,6 +1,6 @@
 [package]
 name = "nex-shell-integration"
-description = "Shell integration protocol (OSC 133 + extensions) for Nexterm"
+description = "Shell integration protocol (OSC 133 + extensions) for Tonn"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

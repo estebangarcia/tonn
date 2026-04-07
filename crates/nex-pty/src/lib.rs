@@ -1,4 +1,4 @@
-//! Cross-platform PTY abstraction for Nexterm.
+//! Cross-platform PTY abstraction for Tonn.
 
 use nex_common::{NexError, Result, TerminalSize};
 use portable_pty::{CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
@@ -6,22 +6,22 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 // Shell integration scripts embedded at compile time.
-const SHELL_INTEGRATION_ZSH: &str = include_str!("../../../shell/nexterm.zsh");
-const SHELL_INTEGRATION_BASH: &str = include_str!("../../../shell/nexterm.bash");
-const SHELL_INTEGRATION_FISH: &str = include_str!("../../../shell/nexterm.fish");
+const SHELL_INTEGRATION_ZSH: &str = include_str!("../../../shell/tonn.zsh");
+const SHELL_INTEGRATION_BASH: &str = include_str!("../../../shell/tonn.bash");
+const SHELL_INTEGRATION_FISH: &str = include_str!("../../../shell/tonn.fish");
 
 /// Write embedded shell integration scripts to a runtime directory.
 /// Returns the directory path. Prefers a user-local data directory to avoid
 /// writing to a predictable world-writable /tmp path.
 fn ensure_shell_integration_dir() -> Result<PathBuf> {
     let dir = dirs::data_local_dir()
-        .map(|d| d.join("nexterm"))
-        .unwrap_or_else(|| std::env::temp_dir().join("nexterm-shell-integration"));
+        .map(|d| d.join("tonn"))
+        .unwrap_or_else(|| std::env::temp_dir().join("tonn-shell-integration"));
     std::fs::create_dir_all(&dir)?;
 
-    std::fs::write(dir.join("nexterm.zsh"), SHELL_INTEGRATION_ZSH)?;
-    std::fs::write(dir.join("nexterm.bash"), SHELL_INTEGRATION_BASH)?;
-    std::fs::write(dir.join("nexterm.fish"), SHELL_INTEGRATION_FISH)?;
+    std::fs::write(dir.join("tonn.zsh"), SHELL_INTEGRATION_ZSH)?;
+    std::fs::write(dir.join("tonn.bash"), SHELL_INTEGRATION_BASH)?;
+    std::fs::write(dir.join("tonn.fish"), SHELL_INTEGRATION_FISH)?;
 
     Ok(dir)
 }
@@ -68,9 +68,9 @@ impl NexPty {
 
         let mut cmd = CommandBuilder::new(shell);
         cmd.env("TERM", "xterm-256color");
-        cmd.env("NEXTERM", "1");
+        cmd.env("TONN", "1");
         if let Some(port) = mcp_port {
-            cmd.env("NEXTERM_MCP_PORT", port.to_string());
+            cmd.env("TONN_MCP_PORT", port.to_string());
         }
 
         // Auto-inject shell integration
@@ -95,7 +95,7 @@ impl NexPty {
                     // .zshenv: keep ZDOTDIR as wrapper dir (so zsh finds our .zshrc),
                     // but source user's .zshenv from their home.
                     let zshenv = format!(
-                        r#"NEXTERM_USER_ZDOTDIR="{user_zdotdir}"
+                        r#"TONN_USER_ZDOTDIR="{user_zdotdir}"
 [[ -f "{user_zdotdir}/.zshenv" ]] && ZDOTDIR="{user_zdotdir}" source "{user_zdotdir}/.zshenv"
 "#
                     );
@@ -107,23 +107,23 @@ impl NexPty {
                         r#"ZDOTDIR="{user_zdotdir}"
 [[ -f "{user_zdotdir}/.zshrc" ]] && source "{user_zdotdir}/.zshrc"
 # Fix HISTFILE if it got set to the wrapper ZDOTDIR
-[[ "$HISTFILE" == *"/nexterm/"* ]] && HISTFILE="$HOME/.zsh_history"
-source "{script_path}/nexterm.zsh"
+[[ "$HISTFILE" == *"/tonn/"* ]] && HISTFILE="$HOME/.zsh_history"
+source "{script_path}/tonn.zsh"
 "#
                     );
                     std::fs::write(zdotdir.join(".zshrc"), zshrc).ok();
                     cmd.env("ZDOTDIR", zdotdir.display().to_string());
-                    cmd.env("NEXTERM_USER_ZDOTDIR", &user_zdotdir);
+                    cmd.env("TONN_USER_ZDOTDIR", &user_zdotdir);
                 }
                 "bash" => {
                     // Bash: use --rcfile or ENV to source our integration after .bashrc
                     let rcfile = integration_dir.join("bash_init.sh");
                     let wrapper = format!(
-                        r#"# Nexterm auto-injected wrapper
+                        r#"# Tonn auto-injected wrapper
 if [[ -f ~/.bashrc ]]; then
     source ~/.bashrc
 fi
-source "{script_path}/nexterm.bash"
+source "{script_path}/tonn.bash"
 "#
                     );
                     std::fs::write(&rcfile, wrapper).ok();
@@ -131,7 +131,7 @@ source "{script_path}/nexterm.bash"
                 }
                 "fish" => {
                     // Fish: use --init-command
-                    let init = format!("source {script_path}/nexterm.fish");
+                    let init = format!("source {script_path}/tonn.fish");
                     cmd.args(["--init-command", &init]);
                 }
                 _ => {}

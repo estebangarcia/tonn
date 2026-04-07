@@ -1,4 +1,4 @@
-//! Block model for Nexterm: command-output pairs with compression tiers.
+//! Block model for Tonn: command-output pairs with compression tiers.
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;

@@ -18,7 +18,6 @@ use nex_shell_integration::{OscScanner, ShellState};
 
 use crate::{MuxEventProxy, Rect};
 
-const SCROLLBACK_HISTORY: usize = 10_000;
 const IO_BUFFER_SIZE: usize = 8192;
 
 /// A terminal pane with its own PTY and VT emulator.
@@ -42,6 +41,7 @@ impl Pane {
         block_event_tx: Sender<BlockEvent>,
         event_proxy: &Proxy,
         mcp_port: Option<u16>,
+        scrollback_history: usize,
     ) -> anyhow::Result<Self> {
         let pane_id = PaneId::new();
         let (pty, reader, writer) = NexPty::spawn(shell, size, mcp_port)?;
@@ -64,7 +64,7 @@ impl Pane {
 
         let listener = NexEventListener::new(pane_id, pty_write_tx, event_callback);
         let term_config = TermConfig {
-            scrolling_history: SCROLLBACK_HISTORY,
+            scrolling_history: scrollback_history,
             ..Default::default()
         };
         let term = Term::new(
