@@ -10,8 +10,8 @@ permissions:
   pull-requests: write
 
 jobs:
-  # Step 1: semantic-release determines version, generates changelog, creates GitHub release
-  semantic-release:
+  # Step 1: Determine version, update Cargo.toml + CHANGELOG, create git tag
+  version:
     runs-on: ubuntu-latest
     outputs:
       new_release_published: ${{ steps.semantic.outputs.new_release_published }}
@@ -40,54 +40,69 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Step 2: Build and upload binaries to the release created by semantic-release
+  # Step 2: Build binaries for all platforms (parallel)
   build:
-    needs: semantic-release
-    if: needs.semantic-release.outputs.new_release_published == 'true'
+    needs: version
+    if: needs.version.outputs.new_release_published == 'true'
     strategy:
       matrix:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
             name: tonn-macos-arm64
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             name: tonn-macos-x64
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             name: tonn-linux-x64
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            name: tonn-linux-arm64
+            cross: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             name: tonn-windows-x64
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            name: tonn-windows-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: v${{ needs.semantic-release.outputs.new_release_version }}
+          ref: v${{ needs.version.outputs.new_release_version }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      # Build
-      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross && 'aarch64-linux-gnu-gcc' || '' }}
 
       # macOS: Create .app bundle and DMG
       - name: Package macOS
         if: startsWith(matrix.os, 'macos')
         env:
-          GITHUB_REF_NAME: v${{ needs.semantic-release.outputs.new_release_version }}
+          GITHUB_REF_NAME: v${{ needs.version.outputs.new_release_version }}
         run: |
           chmod +x packaging/macos/package.sh
           ./packaging/macos/package.sh ${{ matrix.target }} ${{ matrix.name }}
 
       # Linux: Create tarball
       - name: Package Linux
-        if: matrix.os == 'ubuntu-22.04'
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           chmod +x packaging/linux/package.sh
           ./packaging/linux/package.sh ${{ matrix.target }} ${{ matrix.name }}
@@ -99,10 +114,37 @@ jobs:
         run: |
           Compress-Archive -Path "target/${{ matrix.target }}/release/tonn.exe" -DestinationPath "${{ matrix.name }}.zip"
 
-      # Upload artifacts to the release created by semantic-release
-      - uses: softprops/action-gh-release@v2
+      # Upload as workflow artifact (not to release yet)
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: v${{ needs.semantic-release.outputs.new_release_version }}
+          name: ${{ matrix.name }}
+          path: |
+            *.dmg
+            *.tar.gz
+            *.zip
+
+  # Step 3: Create GitHub Release with all artifacts
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Write release notes
+        env:
+          NOTES: ${{ needs.version.outputs.new_release_notes }}
+        run: printf '%s' "$NOTES" > RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.new_release_version }}
+          name: v${{ needs.version.outputs.new_release_version }}
+          body_path: RELEASE_NOTES.md
           files: |
             *.dmg
             *.tar.gz
