@@ -1,3 +1,9 @@
+## [1.0.1](https://github.com/estebangarcia/tonn/compare/v1.0.0...v1.0.1) (2026-04-07)
+
+### Bug Fixes
+
+* release pipeline builds all archs correctly ([bac9bec](https://github.com/estebangarcia/tonn/commit/bac9bec2aa3e219484a2eda8c2fb8db1f858ab06))
+
 ## 1.0.0 (2026-04-07)
 
 ### Features
