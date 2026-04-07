@@ -1,4 +1,4 @@
-//! Block model for Nexterm: command-output pairs with compression tiers.
+//! Block model for Tonn: command-output pairs with compression tiers.
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -81,6 +81,11 @@ impl BlockStore {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Count blocks for a pane without cloning (O(1) lookup).
+    pub fn count_for_pane(&self, pane_id: &PaneId) -> usize {
+        self.pane_index.get(pane_id).map(|ids| ids.len()).unwrap_or(0)
     }
 
     pub fn search(&self, pattern: &str, max_results: usize) -> Vec<Arc<Block>> {

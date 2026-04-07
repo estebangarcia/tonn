@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Tonn
+Comment=AI-First Terminal Emulator
+Exec=tonn
+Terminal=false
+Type=Application
+Categories=System;TerminalEmulator;
+Keywords=terminal;console;shell;ai;
+StartupWMClass=tonn

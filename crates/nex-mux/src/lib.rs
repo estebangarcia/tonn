@@ -1,4 +1,4 @@
-//! Built-in terminal multiplexer for Nexterm.
+//! Built-in terminal multiplexer for Tonn.
 //!
 //! Manages tabs, panes (splits), and their associated PTY + terminal instances.
 //! Each pane owns a PTY process and a VT emulator (alacritty_terminal::Term).
@@ -20,10 +20,10 @@ use parking_lot::Mutex;
 
 pub const DEFAULT_TAB_TITLE: &str = "Terminal";
 
-/// Tracks an AI session running in a Nexterm pane.
+/// Tracks an AI session running in a Tonn pane.
 #[derive(Debug, Clone)]
 pub struct ActiveSession {
-    pub tab_index: usize,
+    pub tab_id: TabId,
     pub pane_id: PaneId,
     pub initial_block_count: usize,
 }
@@ -62,6 +62,7 @@ pub struct Mux {
     scale_factor: f32,
     block_event_tx: Sender<BlockEvent>,
     mcp_port: Option<u16>,
+    scrollback_history: usize,
     /// Maps AI session IDs to (tab_index, pane_id, initial_block_count).
     /// The block count at resume time lets us detect when the command finishes.
     active_sessions: HashMap<String, ActiveSession>,
@@ -69,6 +70,7 @@ pub struct Mux {
 
 impl Mux {
     /// Create a new Mux with one tab containing one pane.
+    #[allow(clippy::too_many_arguments)]
     pub fn new<Proxy: MuxEventProxy + 'static>(
         shell: String,
         initial_bounds: Rect,
@@ -77,6 +79,7 @@ impl Mux {
         block_event_tx: Sender<BlockEvent>,
         event_proxy: Proxy,
         mcp_port: Option<u16>,
+        scrollback_history: usize,
     ) -> anyhow::Result<Self> {
         let mut mux = Self {
             panes: HashMap::new(),
@@ -89,6 +92,7 @@ impl Mux {
             scale_factor,
             block_event_tx,
             mcp_port,
+            scrollback_history,
             active_sessions: HashMap::new(),
         };
 
@@ -118,6 +122,7 @@ impl Mux {
             self.block_event_tx.clone(),
             event_proxy,
             self.mcp_port,
+            self.scrollback_history,
         )?;
         let pane_id = pane.id;
         self.panes.insert(pane_id, pane);
@@ -183,19 +188,18 @@ impl Mux {
     ) -> anyhow::Result<bool> {
         // Check if session is already active in a tab
         if let Some(active) = self.active_sessions.get(session_id) {
-            if active.tab_index < self.tabs.len() {
-                let idx = active.tab_index;
+            if let Some(idx) = self.tabs.iter().position(|t| t.id == active.tab_id) {
                 self.switch_tab(idx);
                 return Ok(true);
             }
+            // Tab no longer exists — remove stale entry
             self.active_sessions.remove(session_id);
         }
 
-        let _tab_id = self.new_tab_with_command(bounds, event_proxy, command)?;
-        let tab_idx = self.tabs.len() - 1;
+        let tab_id = self.new_tab_with_command(bounds, event_proxy, command)?;
         let pane_id = self.focused_pane;
         self.active_sessions.insert(session_id.to_string(), ActiveSession {
-            tab_index: tab_idx,
+            tab_id,
             pane_id,
             initial_block_count,
         });
@@ -212,8 +216,7 @@ impl Mux {
     pub fn cleanup_finished_sessions(&mut self, block_store: &nex_block::BlockStore) {
         let finished: Vec<String> = self.active_sessions.iter()
             .filter(|(_, active)| {
-                let current_count = block_store.get_all_for_pane(&active.pane_id).len();
-                current_count > active.initial_block_count
+                block_store.count_for_pane(&active.pane_id) > active.initial_block_count
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -231,13 +234,9 @@ impl Mux {
         for pane_id in tab.layout.pane_ids() {
             self.panes.remove(&pane_id);
         }
-        // Clean up session tracking — remove entries pointing to this tab and fix indices
-        self.active_sessions.retain(|_, active| active.tab_index != index);
-        for active in self.active_sessions.values_mut() {
-            if active.tab_index > index {
-                active.tab_index -= 1;
-            }
-        }
+        // Clean up session tracking — remove entries for the closed tab
+        let closed_tab_id = tab.id;
+        self.active_sessions.retain(|_, active| active.tab_id != closed_tab_id);
         if self.tabs.is_empty() {
             return; // caller should exit
         }
@@ -250,6 +249,12 @@ impl Mux {
             self.zoomed_pane = None;
             self.active_tab = index;
             self.focused_pane = self.tabs[self.active_tab].layout.pane_ids()[0];
+            // Mark all panes in the new tab as dirty so they get reshaped
+            for pane_id in self.tabs[self.active_tab].layout.pane_ids() {
+                if let Some(pane) = self.panes.get(&pane_id) {
+                    pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
     }
 

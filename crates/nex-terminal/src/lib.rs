@@ -1,4 +1,4 @@
-//! Terminal emulation for Nexterm, wrapping alacritty_terminal.
+//! Terminal emulation for Tonn, wrapping alacritty_terminal.
 
 pub use alacritty_terminal::event::Event as TerminalEvent;
 pub use alacritty_terminal::event::EventListener;
@@ -109,62 +109,48 @@ pub struct GridContent {
     pub selection: Option<SelectionRange>,
 }
 
-/// Standard ANSI 256-color palette.
-fn named_color_to_rgb(color: ansi::NamedColor) -> Rgb8 {
-    match color {
-        ansi::NamedColor::Black => Rgb8 { r: 40, g: 40, b: 40 },
-        ansi::NamedColor::Red => Rgb8 { r: 204, g: 60, b: 60 },
-        ansi::NamedColor::Green => Rgb8 { r: 78, g: 201, b: 98 },
-        ansi::NamedColor::Yellow => Rgb8 { r: 229, g: 200, b: 88 },
-        ansi::NamedColor::Blue => Rgb8 { r: 80, g: 140, b: 220 },
-        ansi::NamedColor::Magenta => Rgb8 { r: 186, g: 100, b: 210 },
-        ansi::NamedColor::Cyan => Rgb8 { r: 80, g: 210, b: 210 },
-        ansi::NamedColor::White => Rgb8 { r: 204, g: 204, b: 204 },
-        ansi::NamedColor::BrightBlack => Rgb8 { r: 110, g: 110, b: 110 },
-        ansi::NamedColor::BrightRed => Rgb8 { r: 255, g: 100, b: 100 },
-        ansi::NamedColor::BrightGreen => Rgb8 { r: 100, g: 255, b: 130 },
-        ansi::NamedColor::BrightYellow => Rgb8 { r: 255, g: 240, b: 120 },
-        ansi::NamedColor::BrightBlue => Rgb8 { r: 120, g: 170, b: 255 },
-        ansi::NamedColor::BrightMagenta => Rgb8 { r: 220, g: 140, b: 255 },
-        ansi::NamedColor::BrightCyan => Rgb8 { r: 120, g: 240, b: 240 },
-        ansi::NamedColor::BrightWhite => Rgb8 { r: 240, g: 240, b: 240 },
-        // Foreground/Background/Cursor/etc use default
-        _ => Rgb8 { r: 204, g: 204, b: 204 },
-    }
+/// 16-entry ANSI color palette: indices 0..=15.
+pub type AnsiPalette = [[u8; 3]; 16];
+
+/// Resolve a named ANSI color to RGB using the given palette.
+fn named_color_to_rgb(color: ansi::NamedColor, palette: &AnsiPalette, fg: [u8; 3]) -> Rgb8 {
+    let idx = match color {
+        ansi::NamedColor::Black => 0,
+        ansi::NamedColor::Red => 1,
+        ansi::NamedColor::Green => 2,
+        ansi::NamedColor::Yellow => 3,
+        ansi::NamedColor::Blue => 4,
+        ansi::NamedColor::Magenta => 5,
+        ansi::NamedColor::Cyan => 6,
+        ansi::NamedColor::White => 7,
+        ansi::NamedColor::BrightBlack => 8,
+        ansi::NamedColor::BrightRed => 9,
+        ansi::NamedColor::BrightGreen => 10,
+        ansi::NamedColor::BrightYellow => 11,
+        ansi::NamedColor::BrightBlue => 12,
+        ansi::NamedColor::BrightMagenta => 13,
+        ansi::NamedColor::BrightCyan => 14,
+        ansi::NamedColor::BrightWhite => 15,
+        // Foreground/Background/Cursor/DimForeground/etc — use theme fg
+        _ => return Rgb8 { r: fg[0], g: fg[1], b: fg[2] },
+    };
+    let c = palette[idx];
+    Rgb8 { r: c[0], g: c[1], b: c[2] }
 }
 
 /// Convert the 256-color indexed palette to RGB.
-fn indexed_color_to_rgb(index: u8) -> Rgb8 {
+fn indexed_color_to_rgb(index: u8, palette: &AnsiPalette, _fg: [u8; 3]) -> Rgb8 {
     match index {
         0..=15 => {
-            // Standard colors - map through named
-            let named = match index {
-                0 => ansi::NamedColor::Black,
-                1 => ansi::NamedColor::Red,
-                2 => ansi::NamedColor::Green,
-                3 => ansi::NamedColor::Yellow,
-                4 => ansi::NamedColor::Blue,
-                5 => ansi::NamedColor::Magenta,
-                6 => ansi::NamedColor::Cyan,
-                7 => ansi::NamedColor::White,
-                8 => ansi::NamedColor::BrightBlack,
-                9 => ansi::NamedColor::BrightRed,
-                10 => ansi::NamedColor::BrightGreen,
-                11 => ansi::NamedColor::BrightYellow,
-                12 => ansi::NamedColor::BrightBlue,
-                13 => ansi::NamedColor::BrightMagenta,
-                14 => ansi::NamedColor::BrightCyan,
-                15 => ansi::NamedColor::BrightWhite,
-                _ => unreachable!(),
-            };
-            named_color_to_rgb(named)
+            let c = palette[index as usize];
+            Rgb8 { r: c[0], g: c[1], b: c[2] }
         }
         16..=231 => {
             // 6x6x6 color cube
             let idx = index - 16;
             let r = if idx / 36 > 0 { (idx / 36) * 40 + 55 } else { 0 };
             let g = if (idx % 36) / 6 > 0 { ((idx % 36) / 6) * 40 + 55 } else { 0 };
-            let b = if idx % 6 > 0 { (idx % 6) * 40 + 55 } else { 0 };
+            let b = if !idx.is_multiple_of(6) { (idx % 6) * 40 + 55 } else { 0 };
             Rgb8 { r, g, b }
         }
         232..=255 => {
@@ -175,8 +161,8 @@ fn indexed_color_to_rgb(index: u8) -> Rgb8 {
     }
 }
 
-/// Resolve a terminal color to RGB, with bold brightening for standard colors.
-fn resolve_fg_color(color: ansi::Color, bold: bool) -> Rgb8 {
+/// Resolve a terminal foreground color to RGB, with bold brightening for standard colors.
+fn resolve_fg_color(color: ansi::Color, bold: bool, palette: &AnsiPalette, fg: [u8; 3]) -> Rgb8 {
     match color {
         ansi::Color::Named(named) => {
             // Bold + standard color (0-7) → bright variant (8-15)
@@ -195,32 +181,37 @@ fn resolve_fg_color(color: ansi::Color, bold: bool) -> Rgb8 {
             } else {
                 named
             };
-            named_color_to_rgb(named)
+            named_color_to_rgb(named, palette, fg)
         }
         ansi::Color::Spec(rgb) => Rgb8 { r: rgb.r, g: rgb.g, b: rgb.b },
         ansi::Color::Indexed(idx) => {
             // Bold + indexed 0-7 → indexed 8-15
             let idx = if bold && idx < 8 { idx + 8 } else { idx };
-            indexed_color_to_rgb(idx)
+            indexed_color_to_rgb(idx, palette, fg)
         }
     }
 }
 
-const DEFAULT_FG: Rgb8 = Rgb8 { r: 204, g: 204, b: 204 };
-const DEFAULT_BG: Rgb8 = Rgb8 { r: 13, g: 13, b: 18 };
-
 /// Resolve a background color to RGB. No bold-brightening for backgrounds.
-fn resolve_bg_color(color: ansi::Color) -> Option<Rgb8> {
+fn resolve_bg_color(color: ansi::Color, palette: &AnsiPalette, fg: [u8; 3]) -> Option<Rgb8> {
     match color {
         ansi::Color::Named(ansi::NamedColor::Background) => None, // default bg, skip
-        ansi::Color::Named(named) => Some(named_color_to_rgb(named)),
+        ansi::Color::Named(named) => Some(named_color_to_rgb(named, palette, fg)),
         ansi::Color::Spec(rgb) => Some(Rgb8 { r: rgb.r, g: rgb.g, b: rgb.b }),
-        ansi::Color::Indexed(idx) => Some(indexed_color_to_rgb(idx)),
+        ansi::Color::Indexed(idx) => Some(indexed_color_to_rgb(idx, palette, fg)),
     }
 }
 
-/// Read the current visible terminal content with colors.
-pub fn read_grid_content<T: EventListener>(term: &Term<T>) -> GridContent {
+/// Read the current visible terminal content with colors, using the given ANSI palette.
+pub fn read_grid_content<T: EventListener>(
+    term: &Term<T>,
+    palette: &AnsiPalette,
+    fg: [u8; 3],
+    bg: [u8; 3],
+) -> GridContent {
+    let default_fg = Rgb8 { r: fg[0], g: fg[1], b: fg[2] };
+    let default_bg = Rgb8 { r: bg[0], g: bg[1], b: bg[2] };
+
     let grid = term.grid();
     let num_lines = grid.screen_lines();
     let num_cols = grid.columns();
@@ -234,7 +225,7 @@ pub fn read_grid_content<T: EventListener>(term: &Term<T>) -> GridContent {
 
         // Build spans by grouping consecutive cells with the same color
         let mut current_text = String::new();
-        let mut current_fg = DEFAULT_FG;
+        let mut current_fg = default_fg;
         let mut current_bold = false;
         let mut current_italic = false;
 
@@ -246,19 +237,19 @@ pub fn read_grid_content<T: EventListener>(term: &Term<T>) -> GridContent {
             let inverse = cell.flags.contains(CellFlags::INVERSE);
 
             // Swap fg/bg when inverse (reverse video) is set
-            let (fg, bg_color) = if inverse {
-                let bg = resolve_bg_color(cell.bg).unwrap_or(DEFAULT_BG);
-                let fg = resolve_fg_color(cell.fg, bold);
-                (bg, Some(fg))
+            let (cell_fg, bg_color) = if inverse {
+                let bg = resolve_bg_color(cell.bg, palette, fg).unwrap_or(default_bg);
+                let fg_resolved = resolve_fg_color(cell.fg, bold, palette, fg);
+                (bg, Some(fg_resolved))
             } else {
-                (resolve_fg_color(cell.fg, bold), resolve_bg_color(cell.bg))
+                (resolve_fg_color(cell.fg, bold, palette, fg), resolve_bg_color(cell.bg, palette, fg))
             };
 
             if let Some(bg) = bg_color {
                 bg_cells.push(BgCell { row: line_idx, col: col_idx, bg });
             }
 
-            if fg != current_fg || bold != current_bold || italic != current_italic {
+            if cell_fg != current_fg || bold != current_bold || italic != current_italic {
                 if !current_text.is_empty() {
                     spans.push(ColoredSpan {
                         text: current_text,
@@ -268,7 +259,7 @@ pub fn read_grid_content<T: EventListener>(term: &Term<T>) -> GridContent {
                     });
                 }
                 current_text = String::new();
-                current_fg = fg;
+                current_fg = cell_fg;
                 current_bold = bold;
                 current_italic = italic;
             }
@@ -290,7 +281,7 @@ pub fn read_grid_content<T: EventListener>(term: &Term<T>) -> GridContent {
         if line_idx < num_lines - 1 {
             spans.push(ColoredSpan {
                 text: "\n".to_string(),
-                fg: DEFAULT_FG,
+                fg: default_fg,
                 bold: false,
                 italic: false,
             });

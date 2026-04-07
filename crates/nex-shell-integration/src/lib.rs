@@ -36,6 +36,12 @@ enum ScanState {
     OscSkip,     // inside an unrecognized OSC, skip until terminator
 }
 
+impl Default for OscScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OscScanner {
     pub fn new() -> Self {
         Self {
@@ -150,14 +156,10 @@ impl OscScanner {
     }
 
     fn parse_osc1337(&self) -> Option<TerminalOscEvent> {
-        // Body format: "Nexterm=cwd;/path/to/dir" or "Nexterm=git;branch;status"
+        // Body format: "Tonn=cwd;/path/to/dir" or "Tonn=git;branch;status"
         let body = std::str::from_utf8(&self.buf).ok()?;
-        let rest = body.strip_prefix("Nexterm=")?;
-        if let Some(path) = rest.strip_prefix("cwd;") {
-            Some(TerminalOscEvent::CwdChanged(path.to_string()))
-        } else {
-            None // git, env, venv — not handled yet
-        }
+        let rest = body.strip_prefix("Tonn=")?;
+        rest.strip_prefix("cwd;").map(|path| TerminalOscEvent::CwdChanged(path.to_string()))
     }
 }
 
@@ -212,14 +214,14 @@ mod tests {
     #[test]
     fn test_scanner_cwd_change() {
         let mut scanner = OscScanner::new();
-        let events = scanner.scan(b"\x1b]1337;Nexterm=cwd;/Users/test/project\x07");
+        let events = scanner.scan(b"\x1b]1337;Tonn=cwd;/Users/test/project\x07");
         assert_eq!(events, vec![TerminalOscEvent::CwdChanged("/Users/test/project".to_string())]);
     }
 
     #[test]
     fn test_scanner_mixed_133_and_1337() {
         let mut scanner = OscScanner::new();
-        let events = scanner.scan(b"\x1b]1337;Nexterm=cwd;/tmp\x07\x1b]133;A\x07");
+        let events = scanner.scan(b"\x1b]1337;Tonn=cwd;/tmp\x07\x1b]133;A\x07");
         assert_eq!(events, vec![
             TerminalOscEvent::CwdChanged("/tmp".to_string()),
             TerminalOscEvent::Osc133(Osc133::PromptStart),

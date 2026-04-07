@@ -1,6 +1,6 @@
 [package]
 name = "nex-pty"
-description = "Cross-platform PTY abstraction for Nexterm"
+description = "Cross-platform PTY abstraction for Tonn"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

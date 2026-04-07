@@ -1,4 +1,4 @@
-//! Token-saving output compression pipeline for Nexterm.
+//! Token-saving output compression pipeline for Tonn.
 
 mod classify;
 mod compress;

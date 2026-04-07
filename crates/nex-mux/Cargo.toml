@@ -1,6 +1,6 @@
 [package]
 name = "nex-mux"
-description = "Built-in terminal multiplexer for Nexterm"
+description = "Built-in terminal multiplexer for Tonn"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

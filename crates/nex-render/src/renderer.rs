@@ -16,25 +16,15 @@ use wgpu::{
 };
 
 use nex_common::{PaneId, CELL_WIDTH_RATIO, LINE_HEIGHT_RATIO, PADDING};
+use nex_config::Theme;
 
 pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 pub const MIN_FONT_SIZE: f32 = 8.0;
 pub const MAX_FONT_SIZE: f32 = 40.0;
 pub const FONT_SIZE_STEP: f32 = 1.0;
 
-const BG_R: u8 = 13;
-const BG_G: u8 = 13;
-const BG_B: u8 = 18;
-
-// Selection highlight
-const SELECTION_COLOR: [u8; 3] = [80, 120, 200];
-
-// Focus border
-const FOCUS_BORDER_COLOR: [u8; 3] = [80, 140, 220];
+// Focus border geometry (not a color — stays as a constant)
 const FOCUS_BORDER_THICKNESS: f32 = 2.0;
-
-// Pane divider
-const DIVIDER_COLOR: [u8; 3] = [90, 90, 105];
 
 // Tab bar layout (logical pixels, scaled by DPI at runtime)
 const TAB_GAP_LOGICAL: f32 = 4.0;
@@ -46,21 +36,7 @@ const TAB_FONT_SIZE_LOGICAL: f32 = 12.0;
 const TAB_LINE_HEIGHT_LOGICAL: f32 = 16.0;
 const TAB_CHAR_WIDTH_RATIO: f32 = 0.6;
 
-// Tab bar colors
-const TAB_BAR_BG: [u8; 3] = [25, 25, 30];
-const TAB_ACTIVE_BG: [u8; 3] = [50, 50, 58];
-const TAB_INACTIVE_BG: [u8; 3] = [35, 35, 40];
-const TAB_ACTIVE_TEXT_COLOR: [u8; 3] = [220, 220, 225];
-const TAB_INACTIVE_TEXT_COLOR: [u8; 3] = [140, 140, 150];
-
-// Default text & cursor
-const DEFAULT_TEXT_COLOR: [u8; 3] = [204, 204, 204];
-const CURSOR_COLOR: [u8; 4] = [200, 200, 200, 180];
-
-// Secondary text (tab/overlay defaults)
-const SECONDARY_TEXT_COLOR: [u8; 3] = [180, 180, 190];
-
-// Overlay (tab switcher)
+// Overlay (tab switcher) layout
 const OVERLAY_PANEL_WIDTH_LOGICAL: f32 = 400.0;
 const OVERLAY_ENTRY_HEIGHT_LOGICAL: f32 = 32.0;
 const OVERLAY_PADDING_LOGICAL: f32 = 12.0;
@@ -69,28 +45,40 @@ const OVERLAY_FONT_SIZE_LOGICAL: f32 = 14.0;
 const OVERLAY_DIM_ALPHA: f32 = 0.75;
 const OVERLAY_ENTRY_INSET_LOGICAL: f32 = 4.0;
 const OVERLAY_ENTRY_GAP_LOGICAL: f32 = 2.0;
-const OVERLAY_PANEL_BG: [u8; 3] = [50, 50, 62];
-const OVERLAY_SELECTED_BG: [u8; 3] = [55, 95, 175];
-const OVERLAY_NORMAL_BG: [u8; 3] = [58, 58, 68];
-const OVERLAY_SELECTED_TEXT_COLOR: [u8; 3] = [255, 255, 255];
-const OVERLAY_NORMAL_TEXT_COLOR: [u8; 3] = [170, 170, 180];
 
-// Session browser overlay
+// Session browser overlay layout
 const SESSION_PANEL_WIDTH_LOGICAL: f32 = 520.0;
 const SESSION_ENTRY_HEIGHT_LOGICAL: f32 = 48.0;
-const SESSION_SEARCH_HEIGHT_LOGICAL: f32 = 48.0; // two text lines: tab bar + search input
+const SESSION_SEARCH_HEIGHT_LOGICAL: f32 = 48.0;
 const SESSION_PADDING_LOGICAL: f32 = 12.0;
 const SESSION_MAX_HEIGHT_RATIO: f32 = 0.75;
 const SESSION_FONT_SIZE_LOGICAL: f32 = 14.0;
 const SESSION_ENTRY_INSET_LOGICAL: f32 = 4.0;
 const SESSION_ENTRY_GAP_LOGICAL: f32 = 2.0;
-const SESSION_SEARCH_BAR_BG: [u8; 3] = [40, 40, 50];
-const SESSION_SEARCH_TEXT_COLOR: [u8; 3] = [200, 200, 210];
-const SESSION_SEARCH_PLACEHOLDER_COLOR: [u8; 3] = [100, 100, 115];
-const SESSION_ACTIVE_INDICATOR_COLOR: [u8; 3] = [80, 200, 120];
-const SESSION_SECONDARY_TEXT_COLOR: [u8; 3] = [120, 120, 135];
 const SESSION_CHAR_WIDTH_RATIO: f32 = 0.6;
-const SESSION_HEADER_SELECTED_BG: [u8; 3] = [65, 65, 80];
+
+// Settings overlay layout
+const SETTINGS_PANEL_WIDTH_LOGICAL: f32 = 500.0;
+const SETTINGS_ENTRY_HEIGHT_LOGICAL: f32 = 32.0;
+const SETTINGS_PADDING_LOGICAL: f32 = 16.0;
+const SETTINGS_FONT_SIZE_LOGICAL: f32 = 14.0;
+const SETTINGS_MAX_HEIGHT_RATIO: f32 = 0.75;
+const SETTINGS_ENTRY_INSET_LOGICAL: f32 = 4.0;
+const SETTINGS_ENTRY_GAP_LOGICAL: f32 = 2.0;
+const SETTINGS_CHAR_WIDTH_RATIO: f32 = 0.6;
+const SETTINGS_FIELD_INDENT: &str = "    ";
+const SETTINGS_SECTION_INDENT: &str = "  ";
+
+const PICKER_PANEL_WIDTH_LOGICAL: f32 = 350.0;
+const PICKER_ENTRY_HEIGHT_LOGICAL: f32 = 28.0;
+const PICKER_SEARCH_HEIGHT_LOGICAL: f32 = 28.0;
+const PICKER_MAX_VISIBLE: usize = 12;
+const PICKER_PADDING_LOGICAL: f32 = 12.0;
+const PICKER_FONT_SIZE_LOGICAL: f32 = 13.0;
+const PICKER_CHAR_WIDTH_RATIO: f32 = 0.6;
+const PICKER_INSET_LOGICAL: f32 = 4.0;
+const PICKER_GAP_LOGICAL: f32 = 2.0;
+const PICKER_DIM_ALPHA: f32 = 0.3;
 
 fn glyphon_rgb(c: [u8; 3]) -> Color {
     Color::rgb(c[0], c[1], c[2])
@@ -132,6 +120,8 @@ pub struct PaneContent {
     pub cursor_col: usize,
     pub is_focused: bool,
     pub bell_active: bool,
+    /// If false, skip text reshaping — reuse the previous frame's buffer.
+    pub needs_reshape: bool,
 }
 
 /// An overlay panel (e.g., tab switcher).
@@ -175,6 +165,46 @@ pub struct SessionOverlayEntry {
     pub is_selected: bool,
 }
 
+/// Settings overlay panel.
+pub struct SettingsOverlay {
+    pub sections: Vec<SettingsSection>,
+    pub selected_row: usize,
+    pub editing: bool,
+    pub edit_value: String,
+    pub picker: Option<PickerOverlay>,
+}
+
+pub struct PickerOverlay {
+    pub title: String,
+    pub entries: Vec<PickerEntry>,
+    pub selected_index: usize,
+    pub filter: String,
+}
+
+pub struct PickerEntry {
+    pub label: String,
+    pub is_current: bool,
+}
+
+pub struct SettingsSection {
+    pub title: String,
+    pub fields: Vec<SettingsField>,
+}
+
+pub struct SettingsField {
+    pub label: String,
+    pub value: String,
+    pub field_type: SettingsFieldType,
+}
+
+#[derive(Clone)]
+pub enum SettingsFieldType {
+    Text,
+    Number,
+    Toggle,
+    Select(Vec<String>),
+}
+
 /// A divider line between split panes.
 pub struct DividerLine {
     pub x: f32,
@@ -209,17 +239,25 @@ pub struct Renderer {
     rect_pipeline: RenderPipeline,
     font_size: f32,
     scale_factor: f32,
+    theme: Theme,
+    font_family: String,
+    measured_cell_width: Option<f32>,
     // Per-pane text buffers (reused across frames)
     pane_buffers: HashMap<PaneId, Buffer>,
     cursor_buffer: Buffer,
     tab_buffers: Vec<Buffer>,
     overlay_buffer: Buffer,
     session_overlay_buffer: Buffer,
+    settings_overlay_buffer: Buffer,
+    picker_buffer: Buffer,
 }
 
 impl Renderer {
     pub async fn new(
         window: std::sync::Arc<winit::window::Window>,
+        theme: Theme,
+        font_family: String,
+        font_size: f32,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let size = window.inner_size();
         let scale_factor = window.scale_factor() as f32;
@@ -317,7 +355,7 @@ impl Renderer {
             TextRenderer::new(&mut text_atlas, &device, MultisampleState::default(), None);
         let viewport = Viewport::new(&device, &cache);
 
-        let font_size = DEFAULT_FONT_SIZE;
+        let font_size = font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
         let physical = font_size * scale_factor;
         let line_height = physical * LINE_HEIGHT_RATIO;
         let metrics = Metrics::new(physical, line_height);
@@ -333,7 +371,15 @@ impl Renderer {
             SESSION_FONT_SIZE_LOGICAL * scale_factor, SESSION_ENTRY_HEIGHT_LOGICAL * scale_factor,
         ));
 
-        Ok(Self {
+        let settings_overlay_buffer = Buffer::new(&mut font_system, Metrics::new(
+            SETTINGS_FONT_SIZE_LOGICAL * scale_factor, SETTINGS_ENTRY_HEIGHT_LOGICAL * scale_factor,
+        ));
+
+        let picker_buffer = Buffer::new(&mut font_system, Metrics::new(
+            PICKER_FONT_SIZE_LOGICAL * scale_factor, PICKER_ENTRY_HEIGHT_LOGICAL * scale_factor,
+        ));
+
+        let mut renderer = Self {
             device,
             queue,
             surface,
@@ -346,12 +392,22 @@ impl Renderer {
             rect_pipeline,
             font_size,
             scale_factor,
+            theme,
+            font_family,
+            measured_cell_width: None,
             pane_buffers: HashMap::new(),
             cursor_buffer,
             tab_buffers: Vec::new(),
             overlay_buffer,
             session_overlay_buffer,
-        })
+            settings_overlay_buffer,
+            picker_buffer,
+        };
+
+        // Measure actual cell width from the font
+        renderer.measure_cell_width();
+
+        Ok(renderer)
     }
 
     pub fn font_size(&self) -> f32 {
@@ -366,6 +422,14 @@ impl Renderer {
         (self.surface_config.width, self.surface_config.height)
     }
 
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
     fn physical_font_size(&self) -> f32 {
         self.font_size * self.scale_factor
     }
@@ -375,7 +439,32 @@ impl Renderer {
     }
 
     fn cell_width(&self) -> f32 {
-        self.physical_font_size() * CELL_WIDTH_RATIO
+        self.measured_cell_width.unwrap_or(self.physical_font_size() * CELL_WIDTH_RATIO)
+    }
+
+    /// Measure the actual monospace cell width by shaping a character.
+    fn measure_cell_width(&mut self) {
+        let physical = self.font_size * self.scale_factor;
+        let lh = physical * LINE_HEIGHT_RATIO;
+        let metrics = Metrics::new(physical, lh);
+        let font_family_name = self.font_family.clone();
+        let family = if font_family_name.is_empty() || font_family_name == "monospace" {
+            Family::Monospace
+        } else {
+            Family::Name(&font_family_name)
+        };
+        let mut buf = Buffer::new(&mut self.font_system, metrics);
+        buf.set_size(&mut self.font_system, Some(1000.0), Some(lh));
+        buf.set_text(&mut self.font_system, "M", &Attrs::new().family(family), Shaping::Advanced, None);
+        buf.shape_until_scroll(&mut self.font_system, false);
+        for run in buf.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                if glyph.w > 0.0 {
+                    self.measured_cell_width = Some(glyph.w);
+                    return;
+                }
+            }
+        }
     }
 
     pub fn set_font_size(&mut self, new_size: f32) -> bool {
@@ -394,7 +483,29 @@ impl Renderer {
         self.cursor_buffer.set_metrics(&mut self.font_system, metrics);
         self.cursor_buffer
             .set_size(&mut self.font_system, Some(physical), Some(line_height));
+        self.measured_cell_width = None;
+        self.measure_cell_width();
         true
+    }
+
+    pub fn set_font_family(&mut self, family: String) {
+        self.font_family = family;
+        self.measured_cell_width = None;
+        self.measure_cell_width();
+    }
+
+    /// List available font family names from the system, sorted alphabetically.
+    /// Includes a "System Default" entry at the top.
+    pub fn list_font_families(&self) -> Vec<String> {
+        let mut families: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for face in self.font_system.db().faces() {
+            for (name, _) in &face.families {
+                families.insert(name.clone());
+            }
+        }
+        let mut result = vec!["System Default (Monospace)".to_string()];
+        result.extend(families);
+        result
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -454,6 +565,7 @@ impl Renderer {
     ///
     /// If both `overlay` (tab switcher) and `session_overlay` (session browser)
     /// are provided, the session browser takes priority.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &mut self,
         tabs: &[TabInfo],
@@ -462,6 +574,7 @@ impl Renderer {
         dividers: &[DividerLine],
         overlay: Option<&OverlayContent>,
         session_overlay: Option<&SessionOverlay>,
+        settings_overlay: Option<&SettingsOverlay>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&TextureViewDescriptor::default());
@@ -482,7 +595,7 @@ impl Renderer {
 
         // When an overlay is active, skip all pane content (bg cells, text, cursor)
         // so it doesn't bleed through the dim
-        let has_overlay = overlay.is_some() || session_overlay.is_some();
+        let has_overlay = overlay.is_some() || session_overlay.is_some() || settings_overlay.is_some();
 
         if !has_overlay {
             for pane in panes {
@@ -503,7 +616,7 @@ impl Renderer {
                 }
 
                 // Selection cells
-                let sel_color = Self::color3(SELECTION_COLOR);
+                let sel_color = Self::color3(self.theme.selection);
                 for cell in &pane.selection_cells {
                     let x0 = ox + PADDING + cell.col as f32 * cw;
                     let y0 = oy + PADDING + cell.row as f32 * lh;
@@ -512,7 +625,7 @@ impl Renderer {
 
                 // Focus border (colored border around focused pane)
                 if pane.is_focused && panes.len() > 1 {
-                    let border_color = Self::color3(FOCUS_BORDER_COLOR);
+                    let border_color = Self::color3(self.theme.focus_border);
                     let t = FOCUS_BORDER_THICKNESS;
                     all_rect_vertices.extend_from_slice(&self.build_rect_vertices(ox, oy, pane.width, t, border_color));
                     all_rect_vertices.extend_from_slice(&self.build_rect_vertices(ox, oy + pane.height - t, pane.width, t, border_color));
@@ -523,7 +636,7 @@ impl Renderer {
         }
 
         // Divider lines
-        let div_color = Self::color3(DIVIDER_COLOR);
+        let div_color = Self::color3(self.theme.divider);
         for div in dividers {
             all_rect_vertices.extend_from_slice(
                 &self.build_rect_vertices(div.x, div.y, div.width, div.height, div_color),
@@ -543,7 +656,7 @@ impl Renderer {
         };
 
         if !tabs.is_empty() {
-            let tab_bg = Self::color3(TAB_BAR_BG);
+            let tab_bg = Self::color3(self.theme.tab_bar_bg);
             all_rect_vertices.extend_from_slice(
                 &self.build_rect_vertices(0.0, 0.0, surface_w, tab_bar_height, tab_bg),
             );
@@ -554,9 +667,9 @@ impl Renderer {
                 let x = tab_gap + i as f32 * (tab_width + tab_gap);
                 let y = tab_gap;
                 let color = if tab.is_active {
-                    Self::color3(TAB_ACTIVE_BG)
+                    Self::color3(self.theme.tab_active_bg)
                 } else {
-                    Self::color3(TAB_INACTIVE_BG)
+                    Self::color3(self.theme.tab_inactive_bg)
                 };
                 all_rect_vertices.extend_from_slice(
                     &self.build_rect_vertices(x, y, tab_width, tab_inner_h, color),
@@ -565,8 +678,15 @@ impl Renderer {
         }
 
         // --- Phase 1: Populate all text buffers ---
-        let mono = Family::Monospace;
-        let default_attrs = Attrs::new().family(mono);
+        // Pane content uses configured font; UI elements always use system monospace
+        let font_family_name = self.font_family.clone();
+        let pane_font = if font_family_name.is_empty() || font_family_name == "monospace" {
+            Family::Monospace
+        } else {
+            Family::Name(&font_family_name)
+        };
+        let ui_font = Family::Monospace;
+        let default_attrs = Attrs::new().family(pane_font);
         let metrics = Metrics::new(self.physical_font_size(), self.line_height());
 
         // Track cursor info for the focused pane
@@ -578,17 +698,20 @@ impl Renderer {
             });
             buf.set_size(&mut self.font_system, Some(pane.width), Some(pane.height));
 
-            let rich_spans: Vec<(&str, Attrs)> = pane.spans.iter().map(|span| {
-                let mut attrs = Attrs::new()
-                    .family(mono)
-                    .color(Color::rgb(span.r, span.g, span.b));
-                if span.bold { attrs = attrs.weight(Weight::BOLD); }
-                if span.italic { attrs = attrs.style(Style::Italic); }
-                (span.text.as_str(), attrs)
-            }).collect();
+            // Only reshape text when content has changed (dirty flag)
+            if pane.needs_reshape {
+                let rich_spans: Vec<(&str, Attrs)> = pane.spans.iter().map(|span| {
+                    let mut attrs = Attrs::new()
+                        .family(pane_font)
+                        .color(Color::rgb(span.r, span.g, span.b));
+                    if span.bold { attrs = attrs.weight(Weight::BOLD); }
+                    if span.italic { attrs = attrs.style(Style::Italic); }
+                    (span.text.as_str(), attrs)
+                }).collect();
 
-            buf.set_rich_text(&mut self.font_system, rich_spans, &default_attrs, Shaping::Advanced, None);
-            buf.shape_until_scroll(&mut self.font_system, false);
+                buf.set_rich_text(&mut self.font_system, rich_spans, &default_attrs, Shaping::Advanced, None);
+                buf.shape_until_scroll(&mut self.font_system, false);
+            }
 
             if pane.is_focused {
                 let cursor_x = pane.x + PADDING + pane.cursor_col as f32 * cw;
@@ -628,7 +751,7 @@ impl Renderer {
                             right: ((pane.x + pane.width) as i32).min(sw),
                             bottom: ((pane.y + pane.height) as i32).min(sh),
                         },
-                        default_color: glyphon_rgb(DEFAULT_TEXT_COLOR),
+                        default_color: glyphon_rgb(self.theme.fg),
                         custom_glyphs: &[],
                     });
                 }
@@ -646,7 +769,12 @@ impl Renderer {
                         right: br.min(sw),
                         bottom: bb.min(sh),
                     },
-                    default_color: Color::rgba(CURSOR_COLOR[0], CURSOR_COLOR[1], CURSOR_COLOR[2], CURSOR_COLOR[3]),
+                    default_color: Color::rgba(
+                        self.theme.cursor[0],
+                        self.theme.cursor[1],
+                        self.theme.cursor[2],
+                        self.theme.cursor[3],
+                    ),
                 custom_glyphs: &[],
             });
         }
@@ -680,9 +808,9 @@ impl Renderer {
                 };
                 let label = format!("{prefix}{title}");
                 let color = if tab.is_active {
-                    glyphon_rgb(TAB_ACTIVE_TEXT_COLOR)
+                    glyphon_rgb(self.theme.tab_active_text)
                 } else {
-                    glyphon_rgb(TAB_INACTIVE_TEXT_COLOR)
+                    glyphon_rgb(self.theme.tab_inactive_text)
                 };
 
                 let buf = &mut self.tab_buffers[i];
@@ -690,7 +818,7 @@ impl Renderer {
                 buf.set_size(&mut self.font_system, Some(tab_width), Some(tab_line_height));
                 buf.set_text(
                     &mut self.font_system, &label,
-                    &Attrs::new().family(mono).color(color),
+                    &Attrs::new().family(ui_font).color(color),
                     Shaping::Advanced, None,
                 );
                 buf.shape_until_scroll(&mut self.font_system, false);
@@ -707,15 +835,299 @@ impl Renderer {
                         left: 0, top: 0,
                         right: sw, bottom: tab_bar_height as i32,
                     },
-                    default_color: glyphon_rgb(SECONDARY_TEXT_COLOR),
+                    default_color: glyphon_rgb(self.theme.secondary_text),
                     custom_glyphs: &[],
                 });
             }
         }
 
-        // --- Overlay (session browser takes priority over tab switcher) ---
-        let show_tab_overlay = overlay.is_some() && session_overlay.is_none();
-        if let Some(session_ov) = session_overlay {
+        // --- Overlay (settings > session browser > tab switcher) ---
+        let show_tab_overlay = overlay.is_some() && session_overlay.is_none() && settings_overlay.is_none();
+        if let Some(settings_ov) = settings_overlay {
+            let scale = self.scale_factor;
+            let panel_w = SETTINGS_PANEL_WIDTH_LOGICAL * scale;
+            let entry_h = SETTINGS_ENTRY_HEIGHT_LOGICAL * scale;
+            let panel_padding = SETTINGS_PADDING_LOGICAL * scale;
+
+            // Count total display rows: 1 title + for each section (1 header + N fields)
+            let total_rows: usize = 1 + settings_ov.sections.iter()
+                .map(|s| 1 + s.fields.len())
+                .sum::<usize>();
+
+            let panel_h = (total_rows as f32 * entry_h + panel_padding * 2.0)
+                .min(sh as f32 * SETTINGS_MAX_HEIGHT_RATIO);
+            let panel_x = (sw as f32 - panel_w) / 2.0;
+            let panel_y = (sh as f32 - panel_h) / 2.0;
+            let content_top = panel_y + panel_padding;
+
+            // Dimmed background
+            let dim = [0.0_f32, 0.0, 0.0, OVERLAY_DIM_ALPHA];
+            all_rect_vertices.extend_from_slice(
+                &self.build_rect_vertices(0.0, 0.0, sw as f32, sh as f32, dim),
+            );
+
+            // Panel background
+            let panel_bg = Self::color3(self.theme.overlay_panel_bg);
+            all_rect_vertices.extend_from_slice(
+                &self.build_rect_vertices(panel_x, panel_y, panel_w, panel_h, panel_bg),
+            );
+
+            // Title row background
+            let title_bg = Self::color3(self.theme.tab_bar_bg);
+            all_rect_vertices.extend_from_slice(
+                &self.build_rect_vertices(panel_x, panel_y, panel_w, entry_h + panel_padding, title_bg),
+            );
+
+            // Field row backgrounds (highlight selected)
+            let mut field_idx: usize = 0;
+            let mut current_row: usize = 1; // row 0 is title
+            for section in &settings_ov.sections {
+                current_row += 1; // section header
+                for _ in &section.fields {
+                    let ey = content_top + current_row as f32 * entry_h;
+                    let color = if field_idx == settings_ov.selected_row {
+                        Self::color3(self.theme.overlay_selected_bg)
+                    } else {
+                        Self::color3(self.theme.overlay_normal_bg)
+                    };
+                    all_rect_vertices.extend_from_slice(
+                        &self.build_rect_vertices(
+                            panel_x + SETTINGS_ENTRY_INSET_LOGICAL * scale,
+                            ey,
+                            panel_w - SETTINGS_ENTRY_INSET_LOGICAL * 2.0 * scale,
+                            entry_h - SETTINGS_ENTRY_GAP_LOGICAL * scale,
+                            color,
+                        ),
+                    );
+                    current_row += 1;
+                    field_idx += 1;
+                }
+            }
+
+            // Build text spans
+            let primary_font_size = SETTINGS_FONT_SIZE_LOGICAL * scale;
+            let settings_metrics = Metrics::new(primary_font_size, entry_h);
+            self.settings_overlay_buffer.set_metrics(&mut self.font_system, settings_metrics);
+            self.settings_overlay_buffer.set_size(&mut self.font_system, Some(panel_w), Some(panel_h));
+            self.settings_overlay_buffer.set_wrap(&mut self.font_system, cosmic_text::Wrap::None);
+
+            let char_w = primary_font_size * SETTINGS_CHAR_WIDTH_RATIO;
+            let usable_w = panel_w - panel_padding * 2.0;
+            let max_chars = (usable_w / char_w).floor().max(10.0) as usize;
+
+            let mut rich_spans: Vec<(String, Attrs)> = Vec::new();
+
+            // Title (centered)
+            let title = "Settings";
+            let title_pad = max_chars.saturating_sub(title.len()) / 2;
+            rich_spans.push((
+                format!("{}{title}", " ".repeat(title_pad)),
+                Attrs::new().family(ui_font).weight(Weight::BOLD).color(glyphon_rgb(self.theme.overlay_selected_text)),
+            ));
+
+            let mut field_idx: usize = 0;
+            for section in &settings_ov.sections {
+                // Section header
+                rich_spans.push(("\n".to_string(), Attrs::new().family(ui_font)));
+                rich_spans.push((
+                    format!("{SETTINGS_SECTION_INDENT}{}", section.title),
+                    Attrs::new().family(ui_font).weight(Weight::BOLD).color(glyphon_rgb(self.theme.secondary_text)),
+                ));
+
+                for field in &section.fields {
+                    rich_spans.push(("\n".to_string(), Attrs::new().family(ui_font)));
+                    let is_selected = field_idx == settings_ov.selected_row;
+                    let text_color = if is_selected {
+                        glyphon_rgb(self.theme.overlay_selected_text)
+                    } else {
+                        glyphon_rgb(self.theme.overlay_normal_text)
+                    };
+                    let value_color = if is_selected {
+                        glyphon_rgb(self.theme.overlay_selected_text)
+                    } else {
+                        glyphon_rgb(self.theme.session_secondary_text)
+                    };
+
+                    let label = format!("{SETTINGS_FIELD_INDENT}{}", field.label);
+                    let value = if is_selected && settings_ov.editing {
+                        format!("{}|", settings_ov.edit_value)
+                    } else {
+                        field.value.clone()
+                    };
+
+                    let padding_count = max_chars.saturating_sub(label.len() + value.len());
+                    rich_spans.push((
+                        label,
+                        Attrs::new().family(ui_font).color(text_color),
+                    ));
+                    rich_spans.push((
+                        format!("{}{value}", " ".repeat(padding_count)),
+                        Attrs::new().family(ui_font).color(value_color),
+                    ));
+
+                    field_idx += 1;
+                }
+            }
+
+            let rich_refs: Vec<(&str, Attrs)> = rich_spans.iter().map(|(t, a)| (t.as_str(), a.clone())).collect();
+            self.settings_overlay_buffer.set_rich_text(
+                &mut self.font_system, rich_refs, &default_attrs, Shaping::Advanced, None,
+            );
+            self.settings_overlay_buffer.shape_until_scroll(&mut self.font_system, false);
+
+            // Only show settings text when picker is NOT open
+            // (picker's dim covers settings rects, but text renders on top)
+            let has_picker = settings_ov.picker.is_some();
+            if !has_picker {
+            text_areas.push(TextArea {
+                buffer: &self.settings_overlay_buffer,
+                left: panel_x + panel_padding,
+                top: content_top,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: panel_x as i32,
+                    top: panel_y as i32,
+                    right: (panel_x + panel_w) as i32,
+                    bottom: (panel_y + panel_h) as i32,
+                },
+                default_color: glyphon_rgb(self.theme.secondary_text),
+                custom_glyphs: &[],
+            });
+            } // end if !has_picker
+
+            // --- Picker popup (rendered on top of settings) ---
+            if let Some(picker_ov) = &settings_ov.picker {
+                let pk_panel_w = PICKER_PANEL_WIDTH_LOGICAL * scale;
+                let pk_entry_h = PICKER_ENTRY_HEIGHT_LOGICAL * scale;
+                let pk_search_h = PICKER_SEARCH_HEIGHT_LOGICAL * scale;
+                let pk_padding = PICKER_PADDING_LOGICAL * scale;
+
+                let visible_count = picker_ov.entries.len().min(PICKER_MAX_VISIBLE);
+                let pk_panel_h = pk_search_h + visible_count as f32 * pk_entry_h + pk_padding * 2.0;
+                let pk_panel_x = (sw as f32 - pk_panel_w) / 2.0;
+                let pk_panel_y = (sh as f32 - pk_panel_h) / 2.0;
+
+                // Dim layer over settings
+                let pk_dim = [0.0_f32, 0.0, 0.0, PICKER_DIM_ALPHA];
+                all_rect_vertices.extend_from_slice(
+                    &self.build_rect_vertices(0.0, 0.0, sw as f32, sh as f32, pk_dim),
+                );
+
+                // Picker panel background
+                let pk_bg = Self::color3(self.theme.overlay_panel_bg);
+                all_rect_vertices.extend_from_slice(
+                    &self.build_rect_vertices(pk_panel_x, pk_panel_y, pk_panel_w, pk_panel_h, pk_bg),
+                );
+
+                // Search bar background
+                let search_bg = Self::color3(self.theme.tab_bar_bg);
+                all_rect_vertices.extend_from_slice(
+                    &self.build_rect_vertices(pk_panel_x, pk_panel_y, pk_panel_w, pk_search_h + pk_padding, search_bg),
+                );
+
+                // Scroll offset: keep selected visible
+                let scroll_offset = if picker_ov.selected_index >= PICKER_MAX_VISIBLE {
+                    picker_ov.selected_index - PICKER_MAX_VISIBLE + 1
+                } else {
+                    0
+                };
+
+                // Entry row backgrounds
+                let entries_top = pk_panel_y + pk_padding + pk_search_h;
+                for vi in 0..visible_count {
+                    let entry_idx = scroll_offset + vi;
+                    if entry_idx >= picker_ov.entries.len() { break; }
+                    let ey = entries_top + vi as f32 * pk_entry_h;
+                    let color = if entry_idx == picker_ov.selected_index {
+                        Self::color3(self.theme.overlay_selected_bg)
+                    } else {
+                        Self::color3(self.theme.overlay_normal_bg)
+                    };
+                    all_rect_vertices.extend_from_slice(
+                        &self.build_rect_vertices(
+                            pk_panel_x + PICKER_INSET_LOGICAL * scale,
+                            ey,
+                            pk_panel_w - PICKER_INSET_LOGICAL * 2.0 * scale,
+                            pk_entry_h - PICKER_GAP_LOGICAL * scale,
+                            color,
+                        ),
+                    );
+                }
+
+                // Build picker text
+                let pk_font_size = PICKER_FONT_SIZE_LOGICAL * scale;
+                let pk_metrics = Metrics::new(pk_font_size, pk_entry_h);
+                self.picker_buffer.set_metrics(&mut self.font_system, pk_metrics);
+                self.picker_buffer.set_size(&mut self.font_system, Some(pk_panel_w), Some(pk_panel_h));
+                self.picker_buffer.set_wrap(&mut self.font_system, cosmic_text::Wrap::None);
+
+                let pk_char_w = pk_font_size * PICKER_CHAR_WIDTH_RATIO;
+                let pk_usable_w = pk_panel_w - pk_padding * 2.0;
+                let pk_max_chars = (pk_usable_w / pk_char_w).floor().max(10.0) as usize;
+
+                let mut pk_spans: Vec<(String, Attrs)> = Vec::new();
+
+                // Search line: title + filter
+                let search_display = if picker_ov.filter.is_empty() {
+                    format!("  {} > ", picker_ov.title)
+                } else {
+                    format!("  {} > {}|", picker_ov.title, picker_ov.filter)
+                };
+                pk_spans.push((
+                    search_display,
+                    Attrs::new().family(ui_font).color(glyphon_rgb(self.theme.overlay_selected_text)),
+                ));
+
+                // Visible entries
+                for vi in 0..visible_count {
+                    let entry_idx = scroll_offset + vi;
+                    if entry_idx >= picker_ov.entries.len() { break; }
+                    let entry = &picker_ov.entries[entry_idx];
+                    pk_spans.push(("\n".to_string(), Attrs::new().family(ui_font)));
+
+                    let is_selected = entry_idx == picker_ov.selected_index;
+                    let prefix = if entry.is_current { " ● " } else { "   " };
+                    let label = format!("{prefix}{}", entry.label);
+                    let truncated = if label.chars().count() > pk_max_chars {
+                        let t: String = label.chars().take(pk_max_chars.saturating_sub(1)).collect();
+                        format!("{t}…")
+                    } else {
+                        label
+                    };
+
+                    let text_color = if is_selected {
+                        glyphon_rgb(self.theme.overlay_selected_text)
+                    } else {
+                        glyphon_rgb(self.theme.overlay_normal_text)
+                    };
+                    pk_spans.push((
+                        truncated,
+                        Attrs::new().family(ui_font).color(text_color),
+                    ));
+                }
+
+                let pk_refs: Vec<(&str, Attrs)> = pk_spans.iter().map(|(t, a)| (t.as_str(), a.clone())).collect();
+                self.picker_buffer.set_rich_text(
+                    &mut self.font_system, pk_refs, &default_attrs, Shaping::Advanced, None,
+                );
+                self.picker_buffer.shape_until_scroll(&mut self.font_system, false);
+
+                text_areas.push(TextArea {
+                    buffer: &self.picker_buffer,
+                    left: pk_panel_x + pk_padding,
+                    top: pk_panel_y + pk_padding,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: pk_panel_x as i32,
+                        top: pk_panel_y as i32,
+                        right: (pk_panel_x + pk_panel_w) as i32,
+                        bottom: (pk_panel_y + pk_panel_h) as i32,
+                    },
+                    default_color: glyphon_rgb(self.theme.secondary_text),
+                    custom_glyphs: &[],
+                });
+            }
+        } else if let Some(session_ov) = session_overlay {
             let scale = self.scale_factor;
             let panel_w = SESSION_PANEL_WIDTH_LOGICAL * scale;
             let entry_h = SESSION_ENTRY_HEIGHT_LOGICAL * scale;
@@ -749,13 +1161,13 @@ impl Renderer {
             );
 
             // Panel background
-            let panel_bg = Self::color3(OVERLAY_PANEL_BG);
+            let panel_bg = Self::color3(self.theme.overlay_panel_bg);
             all_rect_vertices.extend_from_slice(
                 &self.build_rect_vertices(panel_x, panel_y, panel_w, panel_h, panel_bg),
             );
 
             // Search bar background
-            let search_bg = Self::color3(SESSION_SEARCH_BAR_BG);
+            let search_bg = Self::color3(self.theme.session_search_bar_bg);
             all_rect_vertices.extend_from_slice(
                 &self.build_rect_vertices(
                     panel_x + SESSION_ENTRY_INSET_LOGICAL * scale,
@@ -775,12 +1187,12 @@ impl Renderer {
                 let is_header = matches!(entry.kind, SessionEntryKind::ProjectHeader { .. });
                 let color = if entry.is_selected {
                     if is_header {
-                        Self::color3(SESSION_HEADER_SELECTED_BG)
+                        Self::color3(self.theme.session_header_selected_bg)
                     } else {
-                        Self::color3(OVERLAY_SELECTED_BG)
+                        Self::color3(self.theme.overlay_selected_bg)
                     }
                 } else {
-                    Self::color3(OVERLAY_NORMAL_BG)
+                    Self::color3(self.theme.overlay_normal_bg)
                 };
                 all_rect_vertices.extend_from_slice(
                     &self.build_rect_vertices(
@@ -813,21 +1225,21 @@ impl Renderer {
             if session_ov.filter.is_empty() {
                 rich_spans.push((
                     "Search sessions...".to_string(),
-                    Attrs::new().family(mono).color(glyphon_rgb(SESSION_SEARCH_PLACEHOLDER_COLOR)),
+                    Attrs::new().family(ui_font).color(glyphon_rgb(self.theme.session_search_placeholder)),
                 ));
             } else {
                 rich_spans.push((
                     session_ov.filter.clone(),
-                    Attrs::new().family(mono).color(glyphon_rgb(SESSION_SEARCH_TEXT_COLOR)),
+                    Attrs::new().family(ui_font).color(glyphon_rgb(self.theme.session_search_text)),
                 ));
             }
 
             // Empty state message
             if is_empty {
-                rich_spans.push(("\n".to_string(), Attrs::new().family(mono)));
+                rich_spans.push(("\n".to_string(), Attrs::new().family(ui_font)));
                 rich_spans.push((
                     "  No sessions found".to_string(),
-                    Attrs::new().family(mono).color(glyphon_rgb(SESSION_SEARCH_PLACEHOLDER_COLOR)),
+                    Attrs::new().family(ui_font).color(glyphon_rgb(self.theme.session_search_placeholder)),
                 ));
             }
 
@@ -837,36 +1249,36 @@ impl Renderer {
                 let entry = &session_ov.entries[entry_idx];
 
                 let primary_color = if entry.is_selected {
-                    glyphon_rgb(OVERLAY_SELECTED_TEXT_COLOR)
+                    glyphon_rgb(self.theme.overlay_selected_text)
                 } else {
-                    glyphon_rgb(OVERLAY_NORMAL_TEXT_COLOR)
+                    glyphon_rgb(self.theme.overlay_normal_text)
                 };
                 let secondary_color = if entry.is_selected {
-                    glyphon_rgb(OVERLAY_NORMAL_TEXT_COLOR)
+                    glyphon_rgb(self.theme.overlay_normal_text)
                 } else {
-                    glyphon_rgb(SESSION_SECONDARY_TEXT_COLOR)
+                    glyphon_rgb(self.theme.session_secondary_text)
                 };
 
                 match &entry.kind {
                     SessionEntryKind::ProjectHeader { name, session_count, expanded } => {
                         let arrow = if *expanded { "▾" } else { "▸" };
                         // Line 1: "▾ project_name (N sessions)"
-                        rich_spans.push(("\n".to_string(), Attrs::new().family(mono)));
+                        rich_spans.push(("\n".to_string(), Attrs::new().family(ui_font)));
                         rich_spans.push((
                             format!("{arrow} {name} ({session_count} sessions)"),
-                            Attrs::new().family(mono).weight(Weight::BOLD).color(primary_color),
+                            Attrs::new().family(ui_font).weight(Weight::BOLD).color(primary_color),
                         ));
                         // Line 2: empty (fills the 2-line entry height)
-                        rich_spans.push(("\n".to_string(), Attrs::new().family(mono)));
+                        rich_spans.push(("\n".to_string(), Attrs::new().family(ui_font)));
                     }
                     SessionEntryKind::Session { summary, is_active, tree_prefix, time_ago, message_count, model, .. } => {
                         // Line 1: tree_prefix + [●] "summary..."
-                        rich_spans.push(("\n".to_string(), Attrs::new().family(mono)));
+                        rich_spans.push(("\n".to_string(), Attrs::new().family(ui_font)));
 
                         if !tree_prefix.is_empty() {
                             rich_spans.push((
                                 tree_prefix.clone(),
-                                Attrs::new().family(mono).color(secondary_color),
+                                Attrs::new().family(ui_font).color(secondary_color),
                             ));
                         }
 
@@ -874,12 +1286,12 @@ impl Renderer {
                         if *is_active {
                             rich_spans.push((
                                 active_prefix.to_string(),
-                                Attrs::new().family(mono).color(glyphon_rgb(SESSION_ACTIVE_INDICATOR_COLOR)),
+                                Attrs::new().family(ui_font).color(glyphon_rgb(self.theme.session_active_indicator)),
                             ));
                         } else {
                             rich_spans.push((
                                 active_prefix.to_string(),
-                                Attrs::new().family(mono).color(primary_color),
+                                Attrs::new().family(ui_font).color(primary_color),
                             ));
                         }
 
@@ -894,7 +1306,7 @@ impl Renderer {
                             };
                             rich_spans.push((
                                 format!("\"{summary_display}\""),
-                                Attrs::new().family(mono).color(primary_color),
+                                Attrs::new().family(ui_font).color(primary_color),
                             ));
                         }
 
@@ -907,7 +1319,7 @@ impl Renderer {
                         rich_spans.push((
                             detail_line,
                             Attrs::new()
-                                .family(mono)
+                                .family(ui_font)
                                 .color(secondary_color),
                         ));
                     }
@@ -931,7 +1343,7 @@ impl Renderer {
                     right: (panel_x + panel_w) as i32,
                     bottom: (panel_y + panel_h) as i32,
                 },
-                default_color: glyphon_rgb(SECONDARY_TEXT_COLOR),
+                default_color: glyphon_rgb(self.theme.secondary_text),
                 custom_glyphs: &[],
             });
         }
@@ -967,7 +1379,7 @@ impl Renderer {
             );
 
             // Panel background
-            let panel_bg = Self::color3(OVERLAY_PANEL_BG);
+            let panel_bg = Self::color3(self.theme.overlay_panel_bg);
             all_rect_vertices.extend_from_slice(
                 &self.build_rect_vertices(panel_x, panel_y, panel_w, panel_h, panel_bg),
             );
@@ -977,9 +1389,9 @@ impl Renderer {
                 let entry_idx = scroll_offset + vi;
                 let ey = panel_y + panel_padding + vi as f32 * entry_h;
                 let color = if entry_idx == overlay.selected_index {
-                    Self::color3(OVERLAY_SELECTED_BG)
+                    Self::color3(self.theme.overlay_selected_bg)
                 } else {
-                    Self::color3(OVERLAY_NORMAL_BG)
+                    Self::color3(self.theme.overlay_normal_bg)
                 };
                 all_rect_vertices.extend_from_slice(
                     &self.build_rect_vertices(
@@ -1039,11 +1451,11 @@ impl Renderer {
 
             let rich_spans: Vec<(&str, Attrs)> = spans.iter().map(|(text, is_selected)| {
                 let color = if *is_selected {
-                    glyphon_rgb(OVERLAY_SELECTED_TEXT_COLOR)
+                    glyphon_rgb(self.theme.overlay_selected_text)
                 } else {
-                    glyphon_rgb(OVERLAY_NORMAL_TEXT_COLOR)
+                    glyphon_rgb(self.theme.overlay_normal_text)
                 };
-                (text.as_str(), Attrs::new().family(mono).color(color))
+                (text.as_str(), Attrs::new().family(ui_font).color(color))
             }).collect();
 
             self.overlay_buffer.set_rich_text(
@@ -1062,7 +1474,7 @@ impl Renderer {
                     right: (panel_x + panel_w) as i32,
                     bottom: (panel_y + panel_h) as i32,
                 },
-                default_color: glyphon_rgb(SECONDARY_TEXT_COLOR),
+                default_color: glyphon_rgb(self.theme.secondary_text),
                 custom_glyphs: &[],
             });
         }
@@ -1080,20 +1492,20 @@ impl Renderer {
 
         // --- Encode render pass ---
         let mut encoder = self.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("nexterm_render"),
+            label: Some("tonn_render"),
         });
 
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("nexterm_render_pass"),
+                label: Some("tonn_render_pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: Operations {
                         load: LoadOp::Clear(wgpu::Color {
-                            r: BG_R as f64 / 255.0,
-                            g: BG_G as f64 / 255.0,
-                            b: BG_B as f64 / 255.0,
+                            r: Self::srgb_to_linear(self.theme.bg[0]) as f64,
+                            g: Self::srgb_to_linear(self.theme.bg[1]) as f64,
+                            b: Self::srgb_to_linear(self.theme.bg[2]) as f64,
                             a: 1.0,
                         }),
                         store: StoreOp::Store,

@@ -1,6 +1,6 @@
 [package]
 name = "nex-mcp"
-description = "Built-in MCP server for Nexterm"
+description = "Built-in MCP server for Tonn"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

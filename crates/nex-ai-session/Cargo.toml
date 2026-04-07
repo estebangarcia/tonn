@@ -1,6 +1,6 @@
 [package]
 name = "nex-ai-session"
-description = "AI session discovery and management for Nexterm"
+description = "AI session discovery and management for Tonn"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

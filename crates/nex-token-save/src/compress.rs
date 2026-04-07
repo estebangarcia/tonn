@@ -95,16 +95,14 @@ fn compress_git_diff(stripped: &str) -> CompressedOutput {
 
     // Try to use the stat line if present
     if let Some(caps) = RE_DIFF_STAT.captures(stripped) {
-        if let Some(ins) = caps.get(2) {
-            if let Ok(n) = ins.as_str().parse::<usize>() {
+        if let Some(ins) = caps.get(2)
+            && let Ok(n) = ins.as_str().parse::<usize>() {
                 additions = n;
             }
-        }
-        if let Some(del) = caps.get(3) {
-            if let Ok(n) = del.as_str().parse::<usize>() {
+        if let Some(del) = caps.get(3)
+            && let Ok(n) = del.as_str().parse::<usize>() {
                 deletions = n;
             }
-        }
     }
 
     let summary = format!("diff: {} files, +{} -{}", files.len(), additions, deletions);
@@ -186,12 +184,11 @@ fn compress_log(stripped: &str) -> CompressedOutput {
 
     for line in stripped.lines() {
         let msg = RE_LOG_TIMESTAMP.replace(line, "").to_string();
-        if let Some(last) = groups.last_mut() {
-            if last.0 == msg {
+        if let Some(last) = groups.last_mut()
+            && last.0 == msg {
                 last.1 += 1;
                 continue;
             }
-        }
         groups.push((msg, 1));
     }
 
@@ -245,8 +242,8 @@ fn compress_git_status(stripped: &str) -> CompressedOutput {
         if line.len() < 2 {
             continue;
         }
-        let prefix = &line[..2];
-        let file = line[2..].trim();
+        let prefix = line.get(..2).unwrap_or(line);
+        let file = line.get(2..).unwrap_or("").trim();
         match prefix {
             " M" | "M " | "MM" => {
                 modified += 1;
@@ -364,7 +361,7 @@ fn compress_json(stripped: &str) -> CompressedOutput {
 fn compress_ls(stripped: &str) -> CompressedOutput {
     let lines: Vec<&str> = stripped.lines().collect();
     // Skip the "total N" header if present
-    let entries: Vec<&str> = if lines.first().map_or(false, |l| l.starts_with("total ")) {
+    let entries: Vec<&str> = if lines.first().is_some_and(|l| l.starts_with("total ")) {
         lines[1..].to_vec()
     } else {
         lines.clone()

@@ -1,6 +1,6 @@
 [package]
 name = "nex-ipc"
-description = "Inter-thread communication primitives for Nexterm"
+description = "Inter-thread communication primitives for Tonn"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,12 +1,13 @@
 [package]
 name = "nex-render"
-description = "wgpu GPU-accelerated renderer for Nexterm"
+description = "wgpu GPU-accelerated renderer for Tonn"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 nex-common = { workspace = true }
+nex-config = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 cosmic-text = { workspace = true }

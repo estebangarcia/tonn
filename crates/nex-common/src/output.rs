@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Output classification for domain-specific compression.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OutputClass {
     GitDiff,
     GitLog,
@@ -15,13 +15,8 @@ pub enum OutputClass {
     ErrorMessage,
     Interactive,
     Plain,
+    #[default]
     Unknown,
-}
-
-impl Default for OutputClass {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 /// Compressed output for token savings.
