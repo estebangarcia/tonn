@@ -1,0 +1,15 @@
+## 1.0.0 (2026-04-07)
+
+### Features
+
+* AI Session Browser ([#1](https://github.com/estebangarcia/tonn/issues/1)) ([6f68913](https://github.com/estebangarcia/tonn/commit/6f6891312c8d5752b71d46f30e7a3c736d0bfc0c))
+* block UI, tab system, tab switcher, multi-pane support ([065d264](https://github.com/estebangarcia/tonn/commit/065d264a156136dcb85d0a835f2365362d6aecdb))
+* compressors for LLM outputs ([ad01917](https://github.com/estebangarcia/tonn/commit/ad019176ea427da9dde63141fc4ef4984d329991))
+* initial commit ([77c085a](https://github.com/estebangarcia/tonn/commit/77c085a0765f0740a6ead835a557c3636c6089d6))
+* Settings UI ([#2](https://github.com/estebangarcia/tonn/issues/2)) ([220707c](https://github.com/estebangarcia/tonn/commit/220707c07ec41300b74a13730c8982fa7c330f29))
+* token-saving pipeline with output classification. built-in MCP server ([7700dd3](https://github.com/estebangarcia/tonn/commit/7700dd345e84481d75d743f1ac9bef4af956d594))
+* visual bell and window title update ([867c622](https://github.com/estebangarcia/tonn/commit/867c62280df9d5b8737d8ebf9a98cf1ac7b0fc83))
+
+### Bug Fixes
+
+* various fixes. colour support. powerline support ([c52e5a9](https://github.com/estebangarcia/tonn/commit/c52e5a9bce37899b90274a67025dba18cac28134))
