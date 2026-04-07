@@ -245,8 +245,8 @@ fn compress_git_status(stripped: &str) -> CompressedOutput {
         if line.len() < 2 {
             continue;
         }
-        let prefix = &line[..2];
-        let file = line[2..].trim();
+        let prefix = line.get(..2).unwrap_or(line);
+        let file = line.get(2..).unwrap_or("").trim();
         match prefix {
             " M" | "M " | "MM" => {
                 modified += 1;

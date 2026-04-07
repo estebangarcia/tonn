@@ -458,6 +458,7 @@ struct App {
     terminal_state: Option<Arc<parking_lot::Mutex<nex_mcp::TerminalStateSnapshot>>>,
     block_store: Option<Arc<nex_block::BlockStore>>,
     pending_resize: Option<(u32, u32, std::time::Instant)>,
+    last_slow_update: Option<std::time::Instant>,
     window_focused: bool,
 }
 
@@ -483,6 +484,7 @@ impl App {
             terminal_state: None,
             block_store: None,
             pending_resize: None,
+            last_slow_update: None,
             window_focused: true,
         }
     }
@@ -1705,14 +1707,20 @@ impl App {
         let theme_fg = theme.fg;
         let theme_bg = theme.bg;
         let pane_contents: Vec<PaneContent> = mux.panes_in_active_tab().iter().map(|pane| {
+            let is_dirty = pane.dirty.swap(false, std::sync::atomic::Ordering::Relaxed);
             let term = pane.terminal.lock();
             let content = read_grid_content(&term, &ansi_palette, theme_fg, theme_bg);
 
-            let spans = content.spans.iter().map(|s| RenderSpan {
-                text: s.text.clone(),
-                r: s.fg.r, g: s.fg.g, b: s.fg.b,
-                bold: s.bold, italic: s.italic,
-            }).collect();
+            // Only clone text spans when content has changed (dirty flag)
+            let spans = if is_dirty {
+                content.spans.iter().map(|s| RenderSpan {
+                    text: s.text.clone(),
+                    r: s.fg.r, g: s.fg.g, b: s.fg.b,
+                    bold: s.bold, italic: s.italic,
+                }).collect()
+            } else {
+                Vec::new() // renderer will reuse previous buffer
+            };
 
             let bg_cells = content.bg_cells.iter().map(|c| BgCell {
                 row: c.row, col: c.col,
@@ -1753,6 +1761,7 @@ impl App {
                 cursor_col: content.cursor_col,
                 is_focused: pane.id == focused_id,
                 bell_active: bell_active && pane.id == focused_id,
+                needs_reshape: is_dirty,
             }
         }).collect();
 
@@ -1960,38 +1969,48 @@ impl App {
             }
         }
 
-        // Clean up finished AI sessions (detect when claude --resume exits)
-        if let (Some(mux), Some(store)) = (&mut self.mux, &self.block_store) {
-            mux.cleanup_finished_sessions(store);
-        }
+        // Throttle slow updates (session cleanup + MCP state) to once per second
+        let now = std::time::Instant::now();
+        let should_slow_update = self.last_slow_update
+            .map(|t| now.duration_since(t).as_secs() >= 1)
+            .unwrap_or(true);
 
-        // Update MCP terminal state snapshot
-        if let (Some(ts), Some(mux), Some(store)) =
-            (&self.terminal_state, &self.mux, &self.block_store)
-        {
-            let pane_infos: Vec<nex_mcp::PaneInfo> = mux.panes_in_active_tab().iter().map(|pane| {
-                let recent = store.get_recent(&pane.id, 1);
-                let last_exit = recent.first().and_then(|b| b.exit_code);
-                let cwd = recent.first()
-                    .map(|b| b.cwd.display().to_string())
-                    .unwrap_or_default();
-                nex_mcp::PaneInfo {
-                    id: pane.id.to_string(),
-                    tab_title: mux.tab_titles().iter()
-                        .find(|(_, _, active)| *active)
-                        .map(|(_, title, _)| title.to_string())
-                        .unwrap_or_default(),
-                    cwd,
-                    term_rows: pane.term_size.rows,
-                    term_cols: pane.term_size.cols,
-                    last_exit_code: last_exit,
-                }
-            }).collect();
+        if should_slow_update {
+            self.last_slow_update = Some(now);
 
-            let active_id = mux.focused_pane().map(|p| p.id.to_string());
-            let mut state = ts.lock();
-            state.panes = pane_infos;
-            state.active_pane_id = active_id;
+            // Clean up finished AI sessions
+            if let (Some(mux), Some(store)) = (&mut self.mux, &self.block_store) {
+                mux.cleanup_finished_sessions(store);
+            }
+
+            // Update MCP terminal state snapshot
+            if let (Some(ts), Some(mux), Some(store)) =
+                (&self.terminal_state, &self.mux, &self.block_store)
+            {
+                let pane_infos: Vec<nex_mcp::PaneInfo> = mux.panes_in_active_tab().iter().map(|pane| {
+                    let recent = store.get_recent(&pane.id, 1);
+                    let last_exit = recent.first().and_then(|b| b.exit_code);
+                    let cwd = recent.first()
+                        .map(|b| b.cwd.display().to_string())
+                        .unwrap_or_default();
+                    nex_mcp::PaneInfo {
+                        id: pane.id.to_string(),
+                        tab_title: mux.tab_titles().iter()
+                            .find(|(_, _, active)| *active)
+                            .map(|(_, title, _)| title.to_string())
+                            .unwrap_or_default(),
+                        cwd,
+                        term_rows: pane.term_size.rows,
+                        term_cols: pane.term_size.cols,
+                        last_exit_code: last_exit,
+                    }
+                }).collect();
+
+                let active_id = mux.focused_pane().map(|p| p.id.to_string());
+                let mut state = ts.lock();
+                state.panes = pane_infos;
+                state.active_pane_id = active_id;
+            }
         }
     }
 }

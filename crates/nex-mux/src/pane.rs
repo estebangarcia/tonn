@@ -28,6 +28,8 @@ pub struct Pane {
     pub pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub bounds: Rect,
     pub term_size: TerminalSize,
+    /// Set to true by the I/O thread when terminal content changes.
+    pub dirty: Arc<std::sync::atomic::AtomicBool>,
     _io_thread: JoinHandle<()>,
     _pty_write_thread: JoinHandle<()>,
 }
@@ -44,6 +46,7 @@ impl Pane {
         scrollback_history: usize,
     ) -> anyhow::Result<Self> {
         let pane_id = PaneId::new();
+        let dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (pty, reader, writer) = NexPty::spawn(shell, size, mcp_port)?;
         let pty_writer = Arc::new(Mutex::new(writer));
 
@@ -77,10 +80,11 @@ impl Pane {
         // I/O reader thread
         let io_proxy = event_proxy.clone();
         let io_terminal = Arc::clone(&terminal);
+        let io_dirty = Arc::clone(&dirty);
         let _io_thread = std::thread::Builder::new()
             .name(format!("io-{pane_id}"))
             .spawn(move || {
-                io_thread(pane_id, reader, io_terminal, io_proxy, block_event_tx);
+                io_thread(pane_id, reader, io_terminal, io_proxy, block_event_tx, io_dirty);
             })
             .expect("Failed to spawn I/O thread");
 
@@ -106,6 +110,7 @@ impl Pane {
             pty_writer,
             bounds,
             term_size: size,
+            dirty,
             _io_thread,
             _pty_write_thread,
         })
@@ -119,6 +124,7 @@ fn io_thread<Proxy: MuxEventProxy>(
     terminal: Arc<Mutex<Term<NexEventListener>>>,
     event_proxy: Proxy,
     block_event_tx: Sender<BlockEvent>,
+    dirty: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut processor = ansi::Processor::<ansi::StdSyncHandler>::new();
     let mut osc_scanner = OscScanner::new();
@@ -173,6 +179,7 @@ fn io_thread<Proxy: MuxEventProxy>(
                     let mut term = terminal.lock();
                     processor.advance(&mut *term, data);
                 }
+                dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 event_proxy.send_redraw();
             }
             Err(e) => {

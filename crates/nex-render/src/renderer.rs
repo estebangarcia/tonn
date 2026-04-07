@@ -120,6 +120,8 @@ pub struct PaneContent {
     pub cursor_col: usize,
     pub is_focused: bool,
     pub bell_active: bool,
+    /// If false, skip text reshaping — reuse the previous frame's buffer.
+    pub needs_reshape: bool,
 }
 
 /// An overlay panel (e.g., tab switcher).
@@ -695,17 +697,20 @@ impl Renderer {
             });
             buf.set_size(&mut self.font_system, Some(pane.width), Some(pane.height));
 
-            let rich_spans: Vec<(&str, Attrs)> = pane.spans.iter().map(|span| {
-                let mut attrs = Attrs::new()
-                    .family(pane_font)
-                    .color(Color::rgb(span.r, span.g, span.b));
-                if span.bold { attrs = attrs.weight(Weight::BOLD); }
-                if span.italic { attrs = attrs.style(Style::Italic); }
-                (span.text.as_str(), attrs)
-            }).collect();
+            // Only reshape text when content has changed (dirty flag)
+            if pane.needs_reshape {
+                let rich_spans: Vec<(&str, Attrs)> = pane.spans.iter().map(|span| {
+                    let mut attrs = Attrs::new()
+                        .family(pane_font)
+                        .color(Color::rgb(span.r, span.g, span.b));
+                    if span.bold { attrs = attrs.weight(Weight::BOLD); }
+                    if span.italic { attrs = attrs.style(Style::Italic); }
+                    (span.text.as_str(), attrs)
+                }).collect();
 
-            buf.set_rich_text(&mut self.font_system, rich_spans, &default_attrs, Shaping::Advanced, None);
-            buf.shape_until_scroll(&mut self.font_system, false);
+                buf.set_rich_text(&mut self.font_system, rich_spans, &default_attrs, Shaping::Advanced, None);
+                buf.shape_until_scroll(&mut self.font_system, false);
+            }
 
             if pane.is_focused {
                 let cursor_x = pane.x + PADDING + pane.cursor_col as f32 * cw;
@@ -1082,8 +1087,9 @@ impl Renderer {
                     let is_selected = entry_idx == picker_ov.selected_index;
                     let prefix = if entry.is_current { " ● " } else { "   " };
                     let label = format!("{prefix}{}", entry.label);
-                    let truncated = if label.len() > pk_max_chars {
-                        format!("{}…", &label[..pk_max_chars.saturating_sub(1)])
+                    let truncated = if label.chars().count() > pk_max_chars {
+                        let t: String = label.chars().take(pk_max_chars.saturating_sub(1)).collect();
+                        format!("{t}…")
                     } else {
                         label
                     };

@@ -1,4 +1,4 @@
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use nex_common::PaneId;
 
 /// Events sent from the I/O thread to the block processor.
@@ -30,7 +30,10 @@ pub enum BlockEvent {
     },
 }
 
-/// Create an unbounded channel pair for block events.
+/// Max block events buffered before backpressure on I/O threads.
+const BLOCK_CHANNEL_CAPACITY: usize = 10_000;
+
+/// Create a bounded channel pair for block events.
 pub fn block_channel() -> (Sender<BlockEvent>, Receiver<BlockEvent>) {
-    unbounded()
+    bounded(BLOCK_CHANNEL_CAPACITY)
 }

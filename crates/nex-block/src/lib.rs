@@ -83,6 +83,11 @@ impl BlockStore {
             .unwrap_or_default()
     }
 
+    /// Count blocks for a pane without cloning (O(1) lookup).
+    pub fn count_for_pane(&self, pane_id: &PaneId) -> usize {
+        self.pane_index.get(pane_id).map(|ids| ids.len()).unwrap_or(0)
+    }
+
     pub fn search(&self, pattern: &str, max_results: usize) -> Vec<Arc<Block>> {
         let re = match regex::Regex::new(pattern) {
             Ok(r) => r,
