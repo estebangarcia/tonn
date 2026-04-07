@@ -128,11 +128,10 @@ fn extract_text_content(value: &serde_json::Value) -> Option<String> {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Array(items) => {
             for item in items {
-                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                if item.get("type").and_then(|t| t.as_str()) == Some("text")
+                    && let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                         return Some(text.to_string());
                     }
-                }
             }
             None
         }
@@ -203,58 +202,51 @@ fn parse_session_file(path: &Path) -> Option<AiSession> {
         let msg_type = entry.get("type").and_then(|t| t.as_str());
 
         // Track timestamps from every line that has one
-        if let Some(ts_str) = entry.get("timestamp").and_then(|t| t.as_str()) {
-            if let Ok(ts) = ts_str.parse::<DateTime<Utc>>() {
+        if let Some(ts_str) = entry.get("timestamp").and_then(|t| t.as_str())
+            && let Ok(ts) = ts_str.parse::<DateTime<Utc>>() {
                 if first_timestamp.is_none() {
                     first_timestamp = Some(ts);
                 }
                 last_timestamp = Some(ts);
             }
-        }
 
         // Extract parent session ID from forkedFrom or parentSessionId
         if parent_id.is_none() {
-            if let Some(forked) = entry.get("forkedFrom") {
-                if let Some(pid) = forked.get("sessionId").and_then(|v| v.as_str()) {
+            if let Some(forked) = entry.get("forkedFrom")
+                && let Some(pid) = forked.get("sessionId").and_then(|v| v.as_str()) {
                     parent_id = Some(pid.to_string());
                 }
-            }
-            if parent_id.is_none() {
-                if let Some(pid) = entry.get("parentSessionId").and_then(|v| v.as_str()) {
+            if parent_id.is_none()
+                && let Some(pid) = entry.get("parentSessionId").and_then(|v| v.as_str()) {
                     parent_id = Some(pid.to_string());
                 }
-            }
         }
 
         // Extract cwd from the first message that has it
-        if cwd.is_none() {
-            if let Some(c) = entry.get("cwd").and_then(|v| v.as_str()) {
+        if cwd.is_none()
+            && let Some(c) = entry.get("cwd").and_then(|v| v.as_str()) {
                 cwd = Some(c.to_string());
             }
-        }
 
         match msg_type {
             Some("user") => {
                 message_count += 1;
-                if summary.is_none() {
-                    if let Some(content) = entry.get("message").and_then(|m| m.get("content")) {
-                        if let Some(text) = extract_text_content(content) {
+                if summary.is_none()
+                    && let Some(content) = entry.get("message").and_then(|m| m.get("content"))
+                        && let Some(text) = extract_text_content(content) {
                             summary = Some(truncate_summary(&text));
                         }
-                    }
-                }
             }
             Some("assistant") => {
                 message_count += 1;
-                if model.is_none() {
-                    if let Some(m) = entry
+                if model.is_none()
+                    && let Some(m) = entry
                         .get("message")
                         .and_then(|msg| msg.get("model"))
                         .and_then(|v| v.as_str())
                     {
                         model = Some(m.to_string());
                     }
-                }
             }
             _ => {}
         }

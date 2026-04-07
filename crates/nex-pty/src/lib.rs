@@ -52,6 +52,7 @@ pub struct NexPty {
 impl NexPty {
     /// Spawn a new PTY with the given shell command.
     /// Automatically injects shell integration for supported shells.
+    #[allow(clippy::type_complexity)]
     pub fn spawn(shell: &str, size: TerminalSize, mcp_port: Option<u16>) -> Result<(Self, Box<dyn Read + Send>, Box<dyn Write + Send>)> {
         let pty_system = native_pty_system();
 

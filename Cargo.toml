@@ -21,7 +21,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/tonn-sh/tonn"
+repository = "https://github.com/estebangarcia/tonn"
 rust-version = "1.85"
 
 [workspace.dependencies]

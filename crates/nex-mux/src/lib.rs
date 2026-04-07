@@ -70,6 +70,7 @@ pub struct Mux {
 
 impl Mux {
     /// Create a new Mux with one tab containing one pane.
+    #[allow(clippy::too_many_arguments)]
     pub fn new<Proxy: MuxEventProxy + 'static>(
         shell: String,
         initial_bounds: Rect,

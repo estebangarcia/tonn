@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Top-level Tonn configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TonnConfig {
     pub general: GeneralConfig,
@@ -10,18 +10,6 @@ pub struct TonnConfig {
     pub mux: MuxConfig,
     pub mcp: McpConfig,
     pub autocomplete: AutocompleteConfig,
-}
-
-impl Default for TonnConfig {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            rendering: RenderingConfig::default(),
-            mux: MuxConfig::default(),
-            mcp: McpConfig::default(),
-            autocomplete: AutocompleteConfig::default(),
-        }
-    }
 }
 
 /// All available built-in theme names.

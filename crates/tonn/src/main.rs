@@ -168,7 +168,7 @@ impl SessionBrowser {
         }
         // Update active_only based on tab
         let labels = self.tab_labels();
-        self.active_only = labels.get(self.selected_tab).map_or(false, |l| l == SESSION_FILTER_ACTIVE);
+        self.active_only = labels.get(self.selected_tab).is_some_and(|l| l == SESSION_FILTER_ACTIVE);
         self.rebuild_display();
     }
 
@@ -197,11 +197,10 @@ impl SessionBrowser {
                 .into_iter()
                 .filter(|f| {
                     // Tool filter
-                    if let Some(ref tool_name) = tool_filter {
-                        if f.session.tool.to_string() != *tool_name {
+                    if let Some(ref tool_name) = tool_filter
+                        && f.session.tool.to_string() != *tool_name {
                             return false;
                         }
-                    }
                     if self.active_only && !self.is_active_in_tonn(&f.session.id) {
                         return false;
                     }
@@ -248,8 +247,8 @@ impl SessionBrowser {
     }
 
     fn toggle_expand(&mut self) {
-        if let Some(entry) = self.display_entries.get(self.selected_index) {
-            if let DisplayEntryKind::ProjectHeader { name, .. } = &entry.kind {
+        if let Some(entry) = self.display_entries.get(self.selected_index)
+            && let DisplayEntryKind::ProjectHeader { name, .. } = &entry.kind {
                 let name = name.clone();
                 if self.expanded_projects.contains(&name) {
                     self.expanded_projects.remove(&name);
@@ -258,29 +257,24 @@ impl SessionBrowser {
                 }
                 self.rebuild_display();
             }
-        }
     }
 
     fn expand_at_selection(&mut self) {
-        if let Some(entry) = self.display_entries.get(self.selected_index) {
-            if let DisplayEntryKind::ProjectHeader { name, expanded, .. } = &entry.kind {
-                if !expanded {
+        if let Some(entry) = self.display_entries.get(self.selected_index)
+            && let DisplayEntryKind::ProjectHeader { name, expanded, .. } = &entry.kind
+                && !expanded {
                     self.expanded_projects.insert(name.clone());
                     self.rebuild_display();
                 }
-            }
-        }
     }
 
     fn collapse_at_selection(&mut self) {
-        if let Some(entry) = self.display_entries.get(self.selected_index) {
-            if let DisplayEntryKind::ProjectHeader { name, expanded, .. } = &entry.kind {
-                if *expanded {
+        if let Some(entry) = self.display_entries.get(self.selected_index)
+            && let DisplayEntryKind::ProjectHeader { name, expanded, .. } = &entry.kind
+                && *expanded {
                     self.expanded_projects.remove(name);
                     self.rebuild_display();
                 }
-            }
-        }
     }
 
     fn is_header_selected(&self) -> bool {
@@ -595,11 +589,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Redraw => {
                 // Only request redraw when focused — avoids queuing hundreds
                 // of redraws while unfocused (e.g., during Claude Code streaming)
-                if self.window_focused {
-                    if let Some(window) = &self.window {
+                if self.window_focused
+                    && let Some(window) = &self.window {
                         window.request_redraw();
                     }
-                }
             }
             UserEvent::McpExecute(cmd) => {
                 tracing::debug!(command = %cmd.command, "MCP execute: running as subprocess");
@@ -860,16 +853,14 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 };
-                if scroll_lines != 0 {
-                    if let Some(mux) = &self.mux {
-                        if let Some(pane) = mux.focused_pane() {
+                if scroll_lines != 0
+                    && let Some(mux) = &self.mux
+                        && let Some(pane) = mux.focused_pane() {
                             let mut term = pane.terminal.lock();
                             term.grid_mut().scroll_display(
                                 alacritty_terminal::grid::Scroll::Delta(scroll_lines),
                             );
                         }
-                    }
-                }
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -878,16 +869,14 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x, position.y);
                 if self.mouse_selecting {
-                    if let Some((point, side)) = self.pixel_to_grid(position.x, position.y) {
-                        if let Some(mux) = &self.mux {
-                            if let Some(pane) = mux.focused_pane() {
+                    if let Some((point, side)) = self.pixel_to_grid(position.x, position.y)
+                        && let Some(mux) = &self.mux
+                            && let Some(pane) = mux.focused_pane() {
                                 let mut term = pane.terminal.lock();
                                 if let Some(ref mut sel) = term.selection {
                                     sel.update(point, side);
                                 }
                             }
-                        }
-                    }
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
@@ -902,14 +891,12 @@ impl ApplicationHandler<UserEvent> for App {
                             mux.focus_pane_at_pixel(self.mouse_pos.0 as f32, self.mouse_pos.1 as f32);
                         }
                         // Start selection
-                        if let Some((point, side)) = self.pixel_to_grid(self.mouse_pos.0, self.mouse_pos.1) {
-                            if let Some(mux) = &self.mux {
-                                if let Some(pane) = mux.focused_pane() {
+                        if let Some((point, side)) = self.pixel_to_grid(self.mouse_pos.0, self.mouse_pos.1)
+                            && let Some(mux) = &self.mux
+                                && let Some(pane) = mux.focused_pane() {
                                     pane.terminal.lock().selection =
                                         Some(Selection::new(SelectionType::Simple, point, side));
                                 }
-                            }
-                        }
                         self.mouse_selecting = true;
                     }
                     ElementState::Released => {
@@ -953,11 +940,10 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
-                if focused {
-                    if let Some(window) = &self.window {
+                if focused
+                    && let Some(window) = &self.window {
                         window.request_redraw();
                     }
-                }
             }
 
             _ => {}
@@ -977,15 +963,14 @@ impl App {
         event_loop: &ActiveEventLoop,
     ) {
         // Scroll to bottom on keypress
-        if let Some(mux) = &self.mux {
-            if let Some(pane) = mux.focused_pane() {
+        if let Some(mux) = &self.mux
+            && let Some(pane) = mux.focused_pane() {
                 let mut term = pane.terminal.lock();
                 if term.grid().display_offset() > 0 {
                     term.grid_mut()
                         .scroll_display(alacritty_terminal::grid::Scroll::Bottom);
                 }
             }
-        }
 
         let ctrl = self.modifiers.state().control_key();
         let super_key = self.modifiers.state().super_key();
@@ -1117,8 +1102,8 @@ impl App {
                     return;
                 }
                 _ => {
-                    if let Some(text) = text {
-                        if !ctrl && !super_key {
+                    if let Some(text) = text
+                        && !ctrl && !super_key {
                             browser.filter.push_str(text);
                             browser.apply_filter();
                             if let Some(window) = &self.window {
@@ -1126,7 +1111,6 @@ impl App {
                             }
                             return;
                         }
-                    }
                 }
             }
         }
@@ -1167,13 +1151,12 @@ impl App {
         if matches!(logical_key, Key::Character(c) if c.as_str() == "v")
             && (super_key || (ctrl && shift))
         {
-            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                if let Ok(text) = clipboard.get_text() {
+            if let Ok(mut clipboard) = arboard::Clipboard::new()
+                && let Ok(text) = clipboard.get_text() {
                     self.write_to_focused(b"\x1b[200~");
                     self.write_to_focused(text.as_bytes());
                     self.write_to_focused(b"\x1b[201~");
                 }
-            }
             return;
         }
 
@@ -1181,15 +1164,12 @@ impl App {
         if matches!(logical_key, Key::Character(c) if c.as_str() == "c")
             && (super_key || (ctrl && shift))
         {
-            if let Some(mux) = &self.mux {
-                if let Some(pane) = mux.focused_pane() {
-                    if let Some(text) = pane.terminal.lock().selection_to_string() {
-                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            if let Some(mux) = &self.mux
+                && let Some(pane) = mux.focused_pane()
+                    && let Some(text) = pane.terminal.lock().selection_to_string()
+                        && let Ok(mut clipboard) = arboard::Clipboard::new() {
                             let _ = clipboard.set_text(text);
                         }
-                    }
-                }
-            }
             return;
         }
 
@@ -1297,8 +1277,8 @@ impl App {
                 _ => None,
             };
             if let Some(size) = new_size {
-                if let Some(renderer) = &mut self.renderer {
-                    if renderer.set_font_size(size) {
+                if let Some(renderer) = &mut self.renderer
+                    && renderer.set_font_size(size) {
                         if let Some(mux) = &mut self.mux {
                             mux.update_font(renderer.font_size(), renderer.scale_factor());
                             let area = Self::pane_area(self.renderer.as_ref().unwrap(), mux.tab_count());
@@ -1308,7 +1288,6 @@ impl App {
                             window.request_redraw();
                         }
                     }
-                }
                 return;
             }
         }
@@ -1387,11 +1366,10 @@ impl App {
 
         if wrote {
             // Clear selection after typing
-            if let Some(mux) = &self.mux {
-                if let Some(pane) = mux.focused_pane() {
+            if let Some(mux) = &self.mux
+                && let Some(pane) = mux.focused_pane() {
                     pane.terminal.lock().selection = None;
                 }
-            }
         }
     }
 }
@@ -1403,7 +1381,7 @@ impl App {
 impl App {
     fn handle_settings_key(&mut self, logical_key: &Key, text: Option<&str>, ctrl: bool, super_key: bool) {
         // When picker is open, route all keys to picker
-        let picker_open = self.settings_panel.as_ref().map_or(false, |p| p.picker.is_some());
+        let picker_open = self.settings_panel.as_ref().is_some_and(|p| p.picker.is_some());
         if picker_open {
             self.handle_picker_key(logical_key, text, ctrl, super_key);
             return;
@@ -1411,7 +1389,7 @@ impl App {
 
         match logical_key {
             Key::Named(NamedKey::Escape) => {
-                let editing = self.settings_panel.as_ref().map_or(false, |p| p.editing);
+                let editing = self.settings_panel.as_ref().is_some_and(|p| p.editing);
                 if editing {
                     let panel = self.settings_panel.as_mut().unwrap();
                     panel.editing = false;
@@ -1437,22 +1415,18 @@ impl App {
                 self.handle_settings_enter();
             }
             Key::Named(NamedKey::Backspace) => {
-                if let Some(panel) = self.settings_panel.as_mut() {
-                    if panel.editing {
+                if let Some(panel) = self.settings_panel.as_mut()
+                    && panel.editing {
                         panel.edit_buffer.pop();
                     }
-                }
             }
             _ => {
-                if let Some(panel) = self.settings_panel.as_mut() {
-                    if panel.editing {
-                        if let Some(text) = text {
-                            if !ctrl && !super_key {
+                if let Some(panel) = self.settings_panel.as_mut()
+                    && panel.editing
+                        && let Some(text) = text
+                            && !ctrl && !super_key {
                                 panel.edit_buffer.push_str(text);
                             }
-                        }
-                    }
-                }
             }
         }
     }
@@ -1516,8 +1490,8 @@ impl App {
                 }
             }
             _ => {
-                if let Some(text) = text {
-                    if !ctrl && !super_key {
+                if let Some(text) = text
+                    && !ctrl && !super_key {
                         picker.filter.push_str(text);
                         picker.apply_filter();
                         // Live preview
@@ -1528,7 +1502,6 @@ impl App {
                             self.apply_settings_preview(&target);
                         }
                     }
-                }
             }
         }
     }
@@ -1599,15 +1572,13 @@ impl App {
                 }
             }
             "general.font_size" => {
-                if let Some(renderer) = &mut self.renderer {
-                    if renderer.set_font_size(font_size) {
-                        if let Some(mux) = &mut self.mux {
+                if let Some(renderer) = &mut self.renderer
+                    && renderer.set_font_size(font_size)
+                        && let Some(mux) = &mut self.mux {
                             mux.update_font(renderer.font_size(), renderer.scale_factor());
                             let area = Self::pane_area(self.renderer.as_ref().unwrap(), mux.tab_count());
                             mux.recalculate_bounds(area);
                         }
-                    }
-                }
             }
             _ => {}
         }
@@ -1963,11 +1934,10 @@ impl App {
             tracing::error!("Render error: {e}");
         }
 
-        if bell_active {
-            if let Some(window) = &self.window {
+        if bell_active
+            && let Some(window) = &self.window {
                 window.request_redraw();
             }
-        }
 
         // Throttle slow updates (session cleanup + MCP state) to once per second
         let now = std::time::Instant::now();

@@ -62,7 +62,7 @@ impl AiSession {
         std::fs::metadata(&self.file_path)
             .and_then(|m| m.modified())
             .map(|modified| {
-                modified.elapsed().map_or(false, |elapsed| {
+                modified.elapsed().is_ok_and(|elapsed| {
                     elapsed.as_secs() < ACTIVE_SESSION_RECENCY_SECS
                 })
             })

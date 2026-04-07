@@ -150,7 +150,7 @@ fn indexed_color_to_rgb(index: u8, palette: &AnsiPalette, _fg: [u8; 3]) -> Rgb8 
             let idx = index - 16;
             let r = if idx / 36 > 0 { (idx / 36) * 40 + 55 } else { 0 };
             let g = if (idx % 36) / 6 > 0 { ((idx % 36) / 6) * 40 + 55 } else { 0 };
-            let b = if idx % 6 > 0 { (idx % 6) * 40 + 55 } else { 0 };
+            let b = if !idx.is_multiple_of(6) { (idx % 6) * 40 + 55 } else { 0 };
             Rgb8 { r, g, b }
         }
         232..=255 => {

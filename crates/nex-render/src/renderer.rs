@@ -565,6 +565,7 @@ impl Renderer {
     ///
     /// If both `overlay` (tab switcher) and `session_overlay` (session browser)
     /// are provided, the session browser takes priority.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_frame(
         &mut self,
         tabs: &[TabInfo],

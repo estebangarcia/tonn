@@ -36,6 +36,12 @@ enum ScanState {
     OscSkip,     // inside an unrecognized OSC, skip until terminator
 }
 
+impl Default for OscScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OscScanner {
     pub fn new() -> Self {
         Self {
@@ -153,11 +159,7 @@ impl OscScanner {
         // Body format: "Tonn=cwd;/path/to/dir" or "Tonn=git;branch;status"
         let body = std::str::from_utf8(&self.buf).ok()?;
         let rest = body.strip_prefix("Tonn=")?;
-        if let Some(path) = rest.strip_prefix("cwd;") {
-            Some(TerminalOscEvent::CwdChanged(path.to_string()))
-        } else {
-            None // git, env, venv — not handled yet
-        }
+        rest.strip_prefix("cwd;").map(|path| TerminalOscEvent::CwdChanged(path.to_string()))
     }
 }
 
