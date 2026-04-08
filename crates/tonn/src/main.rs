@@ -598,7 +598,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // visible without wasting GPU cycles.
                         let now = std::time::Instant::now();
                         let due = self.last_unfocused_redraw
-                            .map_or(true, |t| now.duration_since(t) >= UNFOCUSED_REDRAW_INTERVAL);
+                            .is_none_or(|t| now.duration_since(t) >= UNFOCUSED_REDRAW_INTERVAL);
                         if due {
                             self.last_unfocused_redraw = Some(now);
                             window.request_redraw();
