@@ -1,5 +1,7 @@
 //! Terminal emulation for Tonn, wrapping alacritty_terminal.
 
+pub mod keys;
+
 pub use alacritty_terminal::event::Event as TerminalEvent;
 pub use alacritty_terminal::event::EventListener;
 pub use alacritty_terminal::grid::{Dimensions, Grid};

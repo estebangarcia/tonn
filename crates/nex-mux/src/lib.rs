@@ -438,6 +438,10 @@ impl Mux {
     pub fn toggle_zoom(&mut self, total_bounds: Rect) {
         self.zoomed_pane = if self.zoomed_pane.is_some() { None } else { Some(self.focused_pane) };
         self.recalculate_bounds(total_bounds);
+        // Mark all panes dirty so text buffers are reshaped after layout change
+        for pane in self.panes.values() {
+            pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     pub fn active_layout(&self) -> &LayoutNode {

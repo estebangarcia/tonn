@@ -30,6 +30,7 @@ const RESIZE_DEBOUNCE_MS: u64 = 50;
 const DIVIDER_RENDER_THICKNESS: f32 = 4.0;
 const EXECUTE_STDOUT_MAX_CHARS: usize = 4000;
 const EXECUTE_STDERR_MAX_CHARS: usize = 2000;
+const UNFOCUSED_REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 use nex_terminal::{
     Column, Dimensions, Line, Point, Selection, SelectionType, Side,
     read_grid_content,
@@ -453,6 +454,7 @@ struct App {
     block_store: Option<Arc<nex_block::BlockStore>>,
     pending_resize: Option<(u32, u32, std::time::Instant)>,
     last_slow_update: Option<std::time::Instant>,
+    last_unfocused_redraw: Option<std::time::Instant>,
     window_focused: bool,
 }
 
@@ -479,6 +481,7 @@ impl App {
             block_store: None,
             pending_resize: None,
             last_slow_update: None,
+            last_unfocused_redraw: None,
             window_focused: true,
         }
     }
@@ -587,12 +590,21 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::Redraw => {
-                // Only request redraw when focused — avoids queuing hundreds
-                // of redraws while unfocused (e.g., during Claude Code streaming)
-                if self.window_focused
-                    && let Some(window) = &self.window {
+                if let Some(window) = &self.window {
+                    if self.window_focused {
                         window.request_redraw();
+                    } else {
+                        // Throttle redraws when unfocused so output is still
+                        // visible without wasting GPU cycles.
+                        let now = std::time::Instant::now();
+                        let due = self.last_unfocused_redraw
+                            .map_or(true, |t| now.duration_since(t) >= UNFOCUSED_REDRAW_INTERVAL);
+                        if due {
+                            self.last_unfocused_redraw = Some(now);
+                            window.request_redraw();
+                        }
                     }
+                }
             }
             UserEvent::McpExecute(cmd) => {
                 tracing::debug!(command = %cmd.command, "MCP execute: running as subprocess");
@@ -860,6 +872,7 @@ impl ApplicationHandler<UserEvent> for App {
                             term.grid_mut().scroll_display(
                                 alacritty_terminal::grid::Scroll::Delta(scroll_lines),
                             );
+                            pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -969,12 +982,14 @@ impl App {
                 if term.grid().display_offset() > 0 {
                     term.grid_mut()
                         .scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+                    pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
         let ctrl = self.modifiers.state().control_key();
         let super_key = self.modifiers.state().super_key();
         let shift = self.modifiers.state().shift_key();
+        let alt = self.modifiers.state().alt_key();
 
         // --- Settings panel (Cmd+,) ---
         if super_key && matches!(logical_key, Key::Character(c) if c.as_str() == ",") {
@@ -1294,75 +1309,26 @@ impl App {
 
 
         // --- PTY input ---
-        let mut wrote = false;
-
-        if ctrl {
-            wrote = match logical_key {
-                Key::Character(c) => {
-                    let ch = c.chars().next().unwrap_or('\0');
-                    if ch.is_ascii_alphabetic() {
-                        let ctrl_code = (ch.to_ascii_lowercase() as u8) - b'a' + 1;
-                        self.write_to_focused(&[ctrl_code])
-                    } else {
-                        match ch {
-                            '[' | '3' => self.write_to_focused(b"\x1b"),
-                            '\\' | '4' => self.write_to_focused(b"\x1c"),
-                            ']' | '5' => self.write_to_focused(b"\x1d"),
-                            '/' | '7' => self.write_to_focused(b"\x1f"),
-                            ' ' | '2' => self.write_to_focused(b"\x00"),
-                            _ => false,
-                        }
-                    }
-                }
-                _ => false,
-            };
-        }
-
-        if !wrote {
-            wrote = true;
-            // Check if the focused pane is in application cursor mode
-            let app_cursor = self.mux.as_ref()
+        let key_input = map_winit_key(logical_key, text);
+        let wrote = if let Some(ref key_input) = key_input {
+            let mods = nex_terminal::keys::Modifiers { shift, ctrl, alt };
+            let mode = self.mux.as_ref()
                 .and_then(|m| m.focused_pane())
-                .map(|p| p.terminal.lock().mode().contains(nex_terminal::TermMode::APP_CURSOR))
-                .unwrap_or(false);
-
-            let data: Option<&[u8]> = match logical_key {
-                Key::Named(NamedKey::Enter) => Some(b"\r"),
-                Key::Named(NamedKey::Backspace) => Some(b"\x7f"),
-                Key::Named(NamedKey::Tab) => Some(b"\t"),
-                Key::Named(NamedKey::Escape) => Some(b"\x1b"),
-                Key::Named(NamedKey::ArrowUp) => Some(if app_cursor { b"\x1bOA" } else { b"\x1b[A" }),
-                Key::Named(NamedKey::ArrowDown) => Some(if app_cursor { b"\x1bOB" } else { b"\x1b[B" }),
-                Key::Named(NamedKey::ArrowRight) => Some(if app_cursor { b"\x1bOC" } else { b"\x1b[C" }),
-                Key::Named(NamedKey::ArrowLeft) => Some(if app_cursor { b"\x1bOD" } else { b"\x1b[D" }),
-                Key::Named(NamedKey::Home) => Some(if app_cursor { b"\x1bOH" } else { b"\x1b[H" }),
-                Key::Named(NamedKey::End) => Some(if app_cursor { b"\x1bOF" } else { b"\x1b[F" }),
-                Key::Named(NamedKey::Delete) => Some(b"\x1b[3~"),
-                Key::Named(NamedKey::PageUp) => Some(b"\x1b[5~"),
-                Key::Named(NamedKey::PageDown) => Some(b"\x1b[6~"),
-                _ => {
-                    if !ctrl {
-                        if let Some(text) = text {
-                            // write_to_focused returns bool
-                            if self.write_to_focused(text.as_bytes()) {
-                                // wrote stays true
-                            } else {
-                                wrote = false;
-                            }
-                        } else {
-                            wrote = false;
-                        }
-                        None // already handled
-                    } else {
-                        wrote = false;
-                        None
+                .map(|p| {
+                    let term = p.terminal.lock();
+                    nex_terminal::keys::Mode {
+                        app_cursor: term.mode().contains(nex_terminal::TermMode::APP_CURSOR),
                     }
-                }
-            };
-            if let Some(data) = data {
-                self.write_to_focused(data);
+                })
+                .unwrap_or_default();
+            if let Some(data) = nex_terminal::keys::encode(key_input, &mods, &mode) {
+                self.write_to_focused(&data)
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
 
         if wrote {
             // Clear selection after typing
@@ -1371,6 +1337,41 @@ impl App {
                     pane.terminal.lock().selection = None;
                 }
         }
+    }
+}
+
+/// Convert a winit key + text into the windowing-agnostic key type.
+fn map_winit_key(key: &Key, text: Option<&str>) -> Option<nex_terminal::keys::Key> {
+    use nex_terminal::keys::{Key as K, NamedKey as NK};
+    match key {
+        Key::Named(NamedKey::Enter) => Some(K::Named(NK::Enter)),
+        Key::Named(NamedKey::Backspace) => Some(K::Named(NK::Backspace)),
+        Key::Named(NamedKey::Tab) => Some(K::Named(NK::Tab)),
+        Key::Named(NamedKey::Escape) => Some(K::Named(NK::Escape)),
+        Key::Named(NamedKey::ArrowUp) => Some(K::Named(NK::ArrowUp)),
+        Key::Named(NamedKey::ArrowDown) => Some(K::Named(NK::ArrowDown)),
+        Key::Named(NamedKey::ArrowLeft) => Some(K::Named(NK::ArrowLeft)),
+        Key::Named(NamedKey::ArrowRight) => Some(K::Named(NK::ArrowRight)),
+        Key::Named(NamedKey::Home) => Some(K::Named(NK::Home)),
+        Key::Named(NamedKey::End) => Some(K::Named(NK::End)),
+        Key::Named(NamedKey::Insert) => Some(K::Named(NK::Insert)),
+        Key::Named(NamedKey::Delete) => Some(K::Named(NK::Delete)),
+        Key::Named(NamedKey::PageUp) => Some(K::Named(NK::PageUp)),
+        Key::Named(NamedKey::PageDown) => Some(K::Named(NK::PageDown)),
+        Key::Named(NamedKey::F1) => Some(K::Named(NK::F(1))),
+        Key::Named(NamedKey::F2) => Some(K::Named(NK::F(2))),
+        Key::Named(NamedKey::F3) => Some(K::Named(NK::F(3))),
+        Key::Named(NamedKey::F4) => Some(K::Named(NK::F(4))),
+        Key::Named(NamedKey::F5) => Some(K::Named(NK::F(5))),
+        Key::Named(NamedKey::F6) => Some(K::Named(NK::F(6))),
+        Key::Named(NamedKey::F7) => Some(K::Named(NK::F(7))),
+        Key::Named(NamedKey::F8) => Some(K::Named(NK::F(8))),
+        Key::Named(NamedKey::F9) => Some(K::Named(NK::F(9))),
+        Key::Named(NamedKey::F10) => Some(K::Named(NK::F(10))),
+        Key::Named(NamedKey::F11) => Some(K::Named(NK::F(11))),
+        Key::Named(NamedKey::F12) => Some(K::Named(NK::F(12))),
+        Key::Character(c) => c.chars().next().map(K::Char),
+        _ => text.and_then(|t| t.chars().next()).map(K::Char),
     }
 }
 
