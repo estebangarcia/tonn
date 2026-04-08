@@ -1,3 +1,9 @@
+## [1.0.3](https://github.com/estebangarcia/tonn/compare/v1.0.2...v1.0.3) (2026-04-08)
+
+### Bug Fixes
+
+* bugs with scrolling, key binding, background gpu redraws ([e08c770](https://github.com/estebangarcia/tonn/commit/e08c770de351e22fe0eb16b079656ace6d64a78c))
+
 ## [1.0.2](https://github.com/estebangarcia/tonn/compare/v1.0.1...v1.0.2) (2026-04-07)
 
 ### Bug Fixes
