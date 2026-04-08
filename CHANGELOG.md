@@ -1,3 +1,9 @@
+## [1.0.4](https://github.com/estebangarcia/tonn/compare/v1.0.3...v1.0.4) (2026-04-08)
+
+### Bug Fixes
+
+* clippy fix ([629f8d0](https://github.com/estebangarcia/tonn/commit/629f8d0bf2af00bc4431e5e03def3359be76fba4))
+
 ## [1.0.3](https://github.com/estebangarcia/tonn/compare/v1.0.2...v1.0.3) (2026-04-08)
 
 ### Bug Fixes
