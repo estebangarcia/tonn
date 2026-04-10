@@ -42,8 +42,9 @@ nex-plugin = { path = "crates/nex-plugin" }
 nex-ipc = { path = "crates/nex-ipc" }
 
 # Terminal emulation
-alacritty_terminal = "0.25"
 vte = "0.15"
+bitflags = "2"
+unicode-width = "0.2"
 
 # PTY
 portable-pty = "0.9"

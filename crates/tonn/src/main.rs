@@ -32,7 +32,7 @@ const EXECUTE_STDOUT_MAX_CHARS: usize = 4000;
 const EXECUTE_STDERR_MAX_CHARS: usize = 2000;
 const UNFOCUSED_REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 use nex_terminal::{
-    Column, Dimensions, Line, Point, Selection, SelectionType, Side,
+    Column, Line, Point, Selection, SelectionType, Side,
     read_grid_content,
 };
 
@@ -903,7 +903,7 @@ impl ApplicationHandler<UserEvent> for App {
                         && let Some(pane) = mux.focused_pane() {
                             let mut term = pane.terminal.lock();
                             term.grid_mut().scroll_display(
-                                alacritty_terminal::grid::Scroll::Delta(scroll_lines),
+                                nex_terminal::Scroll::Delta(scroll_lines),
                             );
                             pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -1014,7 +1014,7 @@ impl App {
                 let mut term = pane.terminal.lock();
                 if term.grid().display_offset() > 0 {
                     term.grid_mut()
-                        .scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+                        .scroll_display(nex_terminal::Scroll::Bottom);
                     pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }

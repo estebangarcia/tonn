@@ -36,6 +36,5 @@ arboard = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
 nex-token-save = { workspace = true }
-alacritty_terminal = { workspace = true }
 toml = { workspace = true }
 

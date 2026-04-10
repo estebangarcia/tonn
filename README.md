@@ -24,7 +24,7 @@ The AI doesn't get raw terminal noise. Tonn classifies every command output (git
 
 ### Terminal
 - GPU-accelerated rendering via wgpu
-- Full VT emulation (alacritty_terminal)
+- Mostly full VT emulation
 - Tabs, splits, pane zoom
 - 12 built-in themes (dark, dracula, nord, catppuccin, gruvbox, tokyo-night, and more)
 - Configurable font, font size, scrollback
@@ -107,7 +107,7 @@ Tonn is a Rust workspace of 14 crates:
 crates/
   tonn/               # Main binary: event loop, rendering, input, MCP wiring
   nex-mux/            # Multiplexer: tabs, panes, splits, layout tree
-  nex-terminal/       # VT emulation wrapper (alacritty_terminal)
+  nex-terminal/       # VT emulation wrapper
   nex-pty/            # PTY management, shell integration injection
   nex-render/         # GPU renderer: text (glyphon), backgrounds, overlays
   nex-block/          # Command block model: BlockStore, BlockBuilder

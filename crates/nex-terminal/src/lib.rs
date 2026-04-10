@@ -1,22 +1,38 @@
-//! Terminal emulation for Tonn, wrapping alacritty_terminal.
+//! Terminal emulation for Tonn — from-scratch VT emulator built on `vte`.
 
 pub mod keys;
 
-pub use alacritty_terminal::event::Event as TerminalEvent;
-pub use alacritty_terminal::event::EventListener;
-pub use alacritty_terminal::grid::{Dimensions, Grid};
-pub use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
-pub use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
-pub use alacritty_terminal::term::cell::{Cell, Flags as CellFlags};
-pub use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
-pub use alacritty_terminal::vte::ansi;
-pub use ansi::StdSyncHandler;
+pub mod ansi;
+pub mod cell;
+pub mod config;
+pub mod event;
+pub mod grid;
+pub mod index;
+pub mod mode;
+pub mod parser;
+pub mod selection;
+pub mod term;
 
-use nex_common::PaneId;
-use std::sync::mpsc;
+pub use crate::ansi::StdSyncHandler;
+pub use crate::cell::{Cell, Flags as CellFlags};
+pub use crate::config::Config as TermConfig;
+pub use crate::event::{Event as TerminalEvent, EventListener};
+pub use crate::grid::{Dimensions, Grid, Scroll};
+pub use crate::index::{Column, Direction, Line, Point, Side};
+pub use crate::mode::TermMode;
+pub use crate::selection::{Selection, SelectionRange, SelectionType};
+pub use crate::term::Term;
 
-/// Callback for terminal events that need to reach the main event loop.
-pub type EventCallback = Box<dyn Fn(TerminalEvent) + Send + Sync>;
+// Helpers used by Tonn: event listener, TermSize, colour resolution, and
+// `read_grid_content`. Wrapped in an inner module so the many symbols share
+// imports without polluting the crate root.
+mod legacy_helpers {
+    use super::*;
+    use nex_common::PaneId;
+    use std::sync::mpsc;
+
+    /// Callback for terminal events that need to reach the main event loop.
+    pub type EventCallback = Box<dyn Fn(TerminalEvent) + Send + Sync>;
 
 /// Event listener that forwards terminal events.
 pub struct NexEventListener {
@@ -45,9 +61,6 @@ impl EventListener for NexEventListener {
             | TerminalEvent::ResetTitle
             | TerminalEvent::Bell => {
                 (self.event_callback)(event);
-            }
-            _ => {
-                tracing::trace!(?event, pane_id = %self.pane_id, "terminal event");
             }
         }
     }
@@ -304,3 +317,6 @@ pub fn read_grid_content<T: EventListener>(
         selection,
     }
 }
+} // mod legacy_helpers
+
+pub use legacy_helpers::*;

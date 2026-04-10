@@ -68,7 +68,6 @@ impl Pane {
         let listener = NexEventListener::new(pane_id, pty_write_tx, event_callback);
         let term_config = TermConfig {
             scrolling_history: scrollback_history,
-            ..Default::default()
         };
         let term = Term::new(
             term_config,
