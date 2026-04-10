@@ -408,6 +408,12 @@ impl Mux {
         self.scale_factor = scale_factor;
     }
 
+    /// Update the stored scale factor. Call `recalculate_bounds` afterwards
+    /// to propagate new cell dimensions to PTYs and terminal grids.
+    pub fn set_scale_factor(&mut self, scale_factor: f32) {
+        self.scale_factor = scale_factor;
+    }
+
     // --- Accessors ---
 
     pub fn focused_pane(&self) -> Option<&Pane> {

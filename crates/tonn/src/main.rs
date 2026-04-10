@@ -853,6 +853,39 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                let new_scale = scale_factor as f32;
+                let changed = self.renderer.as_mut()
+                    .is_some_and(|r| r.set_scale_factor(new_scale));
+
+                if changed {
+                    // Defensive surface reconfigure in case no Resized follows.
+                    if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
+                        let size = window.inner_size();
+                        renderer.resize(size.width, size.height);
+                    }
+
+                    if let Some(mux) = &mut self.mux {
+                        mux.set_scale_factor(new_scale);
+                        let area = Self::pane_area(
+                            self.renderer.as_ref().unwrap(),
+                            mux.tab_count(),
+                        );
+                        mux.recalculate_bounds(area);
+
+                        // Mark active-tab panes dirty so their text buffers
+                        // reshape on the next render.
+                        for pane in mux.panes_in_active_tab() {
+                            pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+
             WindowEvent::MouseWheel { delta, .. } => {
                 let scroll_lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as i32 * SCROLL_LINE_MULTIPLIER,

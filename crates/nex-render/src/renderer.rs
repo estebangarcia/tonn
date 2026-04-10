@@ -488,6 +488,30 @@ impl Renderer {
         true
     }
 
+    /// Update the scale factor (e.g. when the window moves to a display with
+    /// a different DPI). Reshapes font metrics for pane text and cursor
+    /// buffers so they render at the new physical size.
+    /// Returns true if the value actually changed.
+    pub fn set_scale_factor(&mut self, new_scale: f32) -> bool {
+        if (new_scale - self.scale_factor).abs() < 0.01 {
+            return false;
+        }
+        self.scale_factor = new_scale;
+        let physical = self.physical_font_size();
+        let line_height = physical * LINE_HEIGHT_RATIO;
+        let metrics = Metrics::new(physical, line_height);
+
+        for buf in self.pane_buffers.values_mut() {
+            buf.set_metrics(&mut self.font_system, metrics);
+        }
+        self.cursor_buffer.set_metrics(&mut self.font_system, metrics);
+        self.cursor_buffer
+            .set_size(&mut self.font_system, Some(physical), Some(line_height));
+        self.measured_cell_width = None;
+        self.measure_cell_width();
+        true
+    }
+
     pub fn set_font_family(&mut self, family: String) {
         self.font_family = family;
         self.measured_cell_width = None;
