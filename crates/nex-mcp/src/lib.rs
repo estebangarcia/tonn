@@ -257,6 +257,9 @@ pub struct TonnMcpServer {
     terminal_state: Arc<Mutex<TerminalStateSnapshot>>,
     execute_tx: ExecuteSender,
     session_manager: Arc<SessionManager>,
+    // Read at runtime by rmcp's `#[tool_handler]` macro-generated dispatch,
+    // but dead-code analysis can't see through the macro expansion.
+    #[allow(dead_code)]
     tool_router: ToolRouter<TonnMcpServer>,
 }
 
@@ -501,6 +504,33 @@ impl ServerHandler for TonnMcpServer {
 // HTTP transport
 // ---------------------------------------------------------------------------
 
+impl TonnMcpServer {
+    /// Start the MCP server on the given HTTP port using streamable HTTP transport.
+    pub async fn start_http(self, port: u16) -> anyhow::Result<()> {
+        use rmcp::transport::streamable_http_server::{
+            session::local::LocalSessionManager,
+            StreamableHttpServerConfig, StreamableHttpService,
+        };
+
+        let config = StreamableHttpServerConfig::default();
+        let session_manager = Arc::new(LocalSessionManager::default());
+
+        let service = StreamableHttpService::new(
+            move || Ok(self.clone()),
+            session_manager,
+            config,
+        );
+
+        let app = axum::Router::new().nest_service("/mcp", service);
+
+        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
+        tracing::info!(port, "Tonn MCP server listening");
+        axum::serve(listener, app).await?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,32 +612,5 @@ mod tests {
         // Unknown tier falls back to summary
         let fallback_json = block_by_tier(&block, "unknown_tier");
         assert_eq!(fallback_json, summary_json);
-    }
-}
-
-impl TonnMcpServer {
-    /// Start the MCP server on the given HTTP port using streamable HTTP transport.
-    pub async fn start_http(self, port: u16) -> anyhow::Result<()> {
-        use rmcp::transport::streamable_http_server::{
-            session::local::LocalSessionManager,
-            StreamableHttpServerConfig, StreamableHttpService,
-        };
-
-        let config = StreamableHttpServerConfig::default();
-        let session_manager = Arc::new(LocalSessionManager::default());
-
-        let service = StreamableHttpService::new(
-            move || Ok(self.clone()),
-            session_manager,
-            config,
-        );
-
-        let app = axum::Router::new().nest_service("/mcp", service);
-
-        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
-        tracing::info!(port, "Tonn MCP server listening");
-        axum::serve(listener, app).await?;
-
-        Ok(())
     }
 }
