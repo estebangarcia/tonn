@@ -242,6 +242,14 @@ impl Mux {
         }
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
         self.focused_pane = self.tabs[self.active_tab].layout.pane_ids()[0];
+        // Mark all panes in the now-active tab as dirty so their text buffers
+        // get reshaped on the next render. Without this, a tab that slides in
+        // after the closed one renders only background cells.
+        for pane_id in self.tabs[self.active_tab].layout.pane_ids() {
+            if let Some(pane) = self.panes.get(&pane_id) {
+                pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn switch_tab(&mut self, index: usize) {
