@@ -48,6 +48,7 @@ pub struct Tab {
     pub id: TabId,
     pub title: String,
     pub layout: LayoutNode,
+    pub zoomed_pane: Option<PaneId>,
 }
 
 /// Top-level multiplexer state.
@@ -56,7 +57,6 @@ pub struct Mux {
     tabs: Vec<Tab>,
     active_tab: usize,
     focused_pane: PaneId,
-    zoomed_pane: Option<PaneId>,
     shell: String,
     font_size: f32,
     scale_factor: f32,
@@ -86,7 +86,6 @@ impl Mux {
             tabs: Vec::new(),
             active_tab: 0,
             focused_pane: PaneId::new(),
-            zoomed_pane: None,
             shell,
             font_size,
             scale_factor,
@@ -101,6 +100,7 @@ impl Mux {
             id: TabId::new(),
             title: DEFAULT_TAB_TITLE.to_string(),
             layout: LayoutNode::Leaf { pane_id },
+            zoomed_pane: None,
         };
         mux.tabs.push(tab);
         mux.focused_pane = pane_id;
@@ -150,6 +150,7 @@ impl Mux {
             id: TabId::new(),
             title: DEFAULT_TAB_TITLE.to_string(),
             layout: LayoutNode::Leaf { pane_id },
+            zoomed_pane: None,
         };
         let tab_id = tab.id;
         self.tabs.push(tab);
@@ -254,7 +255,6 @@ impl Mux {
 
     pub fn switch_tab(&mut self, index: usize) {
         if index < self.tabs.len() {
-            self.zoomed_pane = None;
             self.active_tab = index;
             self.focused_pane = self.tabs[self.active_tab].layout.pane_ids()[0];
             // Mark all panes in the new tab as dirty so they get reshaped
@@ -299,7 +299,7 @@ impl Mux {
         bounds: Rect,
         event_proxy: &Proxy,
     ) -> anyhow::Result<PaneId> {
-        self.zoomed_pane = None;
+        self.tabs[self.active_tab].zoomed_pane = None;
         self._split(direction, bounds, event_proxy)
     }
 
@@ -317,14 +317,13 @@ impl Mux {
     }
 
     pub fn close_pane(&mut self, pane_id: PaneId) {
-        self.zoomed_pane = None;
-
         // Find which tab contains this pane (may be a background tab)
         let tab_index = match self.tabs.iter().position(|tab| tab.layout.pane_ids().contains(&pane_id)) {
             Some(idx) => idx,
             None => return,
         };
 
+        self.tabs[tab_index].zoomed_pane = None;
         let pane_ids = self.tabs[tab_index].layout.pane_ids();
 
         if pane_ids.len() <= 1 {
@@ -388,7 +387,7 @@ impl Mux {
 
         let font_size = self.font_size;
         let scale_factor = self.scale_factor;
-        let zoomed_id = self.zoomed_pane;
+        let zoomed_id = self.tabs[self.active_tab].zoomed_pane;
 
         for (pane_id, tree_bounds) in pane_bounds {
             // Zoomed pane gets full window bounds; others get tree bounds
@@ -433,7 +432,7 @@ impl Mux {
     }
 
     pub fn panes_in_active_tab(&self) -> Vec<&Pane> {
-        if let Some(zoomed_id) = self.zoomed_pane {
+        if let Some(zoomed_id) = self.tabs[self.active_tab].zoomed_pane {
             return self.panes.get(&zoomed_id).into_iter().collect();
         }
         let tab = &self.tabs[self.active_tab];
@@ -445,12 +444,13 @@ impl Mux {
     }
 
     pub fn is_zoomed(&self) -> bool {
-        self.zoomed_pane.is_some()
+        self.tabs[self.active_tab].zoomed_pane.is_some()
     }
 
     /// Toggle fullscreen zoom on the focused pane.
     pub fn toggle_zoom(&mut self, total_bounds: Rect) {
-        self.zoomed_pane = if self.zoomed_pane.is_some() { None } else { Some(self.focused_pane) };
+        let tab = &mut self.tabs[self.active_tab];
+        tab.zoomed_pane = if tab.zoomed_pane.is_some() { None } else { Some(self.focused_pane) };
         self.recalculate_bounds(total_bounds);
         // Mark all panes dirty so text buffers are reshaped after layout change
         for pane in self.panes.values() {

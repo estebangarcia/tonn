@@ -576,22 +576,35 @@ impl Grid {
                 self.rows.push_back(Row::new(cols));
             }
         } else if lines < self.screen_lines {
-            // Shrinking: excess bottom rows are dropped (cursor stays anchored
-            // near the top). We just update screen_lines — the deque is large
-            // enough, and the extra rows become scrollback or are trimmed.
-            let extra = self.screen_lines - lines;
-            // Drop `extra` rows from the back if they're empty; otherwise push
-            // them into scrollback by leaving them and trimming scrollback.
-            // Simplest: leave rows, trim from front if over history limit.
+            // Shrinking: prefer removing empty rows BELOW the cursor first
+            // so the cursor (and the content around it) stays visible.
+            // Whatever deficit remains is pushed from the top into scrollback.
+            let rows_to_remove = self.screen_lines - lines;
+            let rows_below_cursor =
+                (self.screen_lines as i32 - 1 - self.cursor.point.line.0).max(0) as usize;
+            let removed_from_bottom = rows_to_remove.min(rows_below_cursor);
+            let pushed_to_scrollback = rows_to_remove - removed_from_bottom;
+
+            // Pop the bottom rows (below cursor, typically blank after a zoom).
+            for _ in 0..removed_from_bottom {
+                self.rows.pop_back();
+            }
+
+            // The remaining excess comes from the top → becomes scrollback.
+            // Adjust cursor so it stays on the same content.
+            self.cursor.point.line.0 -= pushed_to_scrollback as i32;
+
+            // Trim oldest scrollback if over the history limit.
             while self.rows.len() > self.history_limit + lines {
                 self.rows.pop_front();
             }
-            // Ensure we don't leave a dangling pointer — cursor will be clamped.
-            let _ = extra;
         }
         self.screen_lines = lines;
 
-        // Clamp cursor.
+        // Clamp cursor to the visible screen.
+        if self.cursor.point.line.0 < 0 {
+            self.cursor.point.line.0 = 0;
+        }
         let max_line = (lines - 1) as i32;
         if self.cursor.point.line.0 > max_line {
             self.cursor.point.line.0 = max_line;
