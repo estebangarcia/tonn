@@ -140,6 +140,18 @@ fn io_thread<Proxy: MuxEventProxy>(
             Ok(n) => {
                 let data = &buf[..n];
 
+                // Debug: dump raw PTY bytes to a file when TONN_DEBUG_PTY is set.
+                if std::env::var("TONN_DEBUG_PTY").is_ok() {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/tonn-pty-dump.bin")
+                    {
+                        let _ = f.write_all(data);
+                    }
+                }
+
                 // Scan for OSC sequences and emit BlockEvents
                 for event in osc_scanner.scan(data) {
                     let block_event = match event {

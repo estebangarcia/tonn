@@ -69,6 +69,20 @@ impl<L: EventListener> Term<L> {
     pub fn resize<D: Dimensions>(&mut self, dim: D) {
         let cols = dim.columns();
         let lines = dim.screen_lines();
+        self.selection = None;
+
+        // Reflow the main grid (never the alt grid — apps like vim
+        // manage their own layout). When ALT_SCREEN is active, self.grid
+        // IS the alt grid (swapped by swap_alt_screen), so we reflow
+        // self.alt_grid which holds the main content.
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            if cols != self.alt_grid.columns() {
+                self.alt_grid.reflow(cols);
+            }
+        } else if cols != self.grid.columns() {
+            self.grid.reflow(cols);
+        }
+
         self.grid.resize(cols, lines);
         self.alt_grid.resize(cols, lines);
     }

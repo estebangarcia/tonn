@@ -86,6 +86,12 @@ impl Row {
         }
         self.wrapped = false;
     }
+
+    /// Number of cells up to and including the last non-default cell.
+    /// Returns 0 if the row is entirely default cells.
+    pub fn occupied_len(&self) -> usize {
+        self.cells.iter().rposition(|c| !c.is_default()).map_or(0, |i| i + 1)
+    }
 }
 
 impl Index<Column> for Row {
@@ -559,7 +565,147 @@ impl Grid {
     }
 
     // ---------------------------------------------------------------------
-    // Resize (clip-and-pad, no reflow)
+    // Reflow: re-wrap lines when column count changes
+    // ---------------------------------------------------------------------
+
+    /// Re-wrap all content (screen + scrollback) from the current column
+    /// width to `new_cols`. Wrapped physical rows are merged into logical
+    /// lines, then re-broken at the new width. Cursor position is tracked
+    /// through the transformation.
+    pub fn reflow(&mut self, new_cols: usize) {
+        if new_cols == self.cols || self.cols == 0 || new_cols == 0 {
+            return;
+        }
+
+        let screen_top = self.rows.len().saturating_sub(self.screen_lines);
+        let cursor_deque_idx =
+            (screen_top as i32 + self.cursor.point.line.0).max(0) as usize;
+        let cursor_col = self.cursor.point.column.0;
+        let saved_deque_idx =
+            (screen_top as i32 + self.saved_cursor.point.line.0).max(0) as usize;
+        let saved_col = self.saved_cursor.point.column.0;
+
+        // Phase 1: decompose into logical lines.
+        // Each entry: (cells, Option<cursor_offset>, Option<saved_cursor_offset>)
+        let mut logical_lines: Vec<(Vec<Cell>, Option<usize>, Option<usize>)> = Vec::new();
+        let mut cur_cells: Vec<Cell> = Vec::new();
+        let mut cur_cursor_off: Option<usize> = None;
+        let mut cur_saved_off: Option<usize> = None;
+
+        for (deque_idx, row) in self.rows.iter().enumerate() {
+            let real_len = row.occupied_len();
+
+            if deque_idx == cursor_deque_idx {
+                let clamped = if real_len == 0 { 0 } else { cursor_col.min(real_len - 1) };
+                cur_cursor_off = Some(cur_cells.len() + clamped);
+            }
+            if deque_idx == saved_deque_idx {
+                let clamped = if real_len == 0 { 0 } else { saved_col.min(real_len - 1) };
+                cur_saved_off = Some(cur_cells.len() + clamped);
+            }
+
+            cur_cells.extend_from_slice(&row.cells[..real_len]);
+
+            if !row.wrapped {
+                logical_lines.push((
+                    std::mem::take(&mut cur_cells),
+                    cur_cursor_off.take(),
+                    cur_saved_off.take(),
+                ));
+            }
+        }
+        // Handle trailing wrapped row (shouldn't happen normally).
+        if !cur_cells.is_empty() || cur_cursor_off.is_some() || cur_saved_off.is_some() {
+            logical_lines.push((
+                std::mem::take(&mut cur_cells),
+                cur_cursor_off.take(),
+                cur_saved_off.take(),
+            ));
+        }
+
+        // Phase 2: re-break each logical line at new_cols and rebuild.
+        let mut new_rows: VecDeque<Row> = VecDeque::new();
+        let mut new_cursor_deque: Option<usize> = None;
+        let mut new_cursor_col: usize = 0;
+        let mut new_saved_deque: Option<usize> = None;
+        let mut new_saved_col: usize = 0;
+
+        for (cells, c_off, s_off) in &logical_lines {
+            let base = new_rows.len();
+
+            if cells.is_empty() {
+                new_rows.push_back(Row::new(new_cols));
+                if let Some(off) = c_off {
+                    new_cursor_deque = Some(base);
+                    new_cursor_col = (*off).min(new_cols.saturating_sub(1));
+                }
+                if let Some(off) = s_off {
+                    new_saved_deque = Some(base);
+                    new_saved_col = (*off).min(new_cols.saturating_sub(1));
+                }
+                continue;
+            }
+
+            let num_chunks = cells.len().div_ceil(new_cols);
+            for (i, chunk) in cells.chunks(new_cols).enumerate() {
+                let mut row = Row::new(new_cols);
+                row.cells[..chunk.len()].copy_from_slice(chunk);
+                row.wrapped = i + 1 < num_chunks;
+                new_rows.push_back(row);
+            }
+
+            if let Some(off) = c_off {
+                let off = (*off).min(cells.len().saturating_sub(1));
+                new_cursor_deque = Some(base + off / new_cols);
+                new_cursor_col = off % new_cols;
+            }
+            if let Some(off) = s_off {
+                let off = (*off).min(cells.len().saturating_sub(1));
+                new_saved_deque = Some(base + off / new_cols);
+                new_saved_col = off % new_cols;
+            }
+        }
+
+        // Ensure at least screen_lines rows exist.
+        while new_rows.len() < self.screen_lines {
+            new_rows.push_back(Row::new(new_cols));
+        }
+
+        // Trim oldest scrollback if over history limit.
+        let mut trimmed: usize = 0;
+        while new_rows.len() > self.history_limit + self.screen_lines {
+            new_rows.pop_front();
+            trimmed += 1;
+        }
+
+        // Phase 3: apply.
+        self.rows = new_rows;
+        self.cols = new_cols;
+
+        let new_screen_top = self.rows.len().saturating_sub(self.screen_lines);
+
+        // Map cursor back to screen-relative coordinates.
+        if let Some(di) = new_cursor_deque {
+            let di = di.saturating_sub(trimmed);
+            let line = di as i32 - new_screen_top as i32;
+            self.cursor.point.line = Line(line.clamp(0, self.screen_lines as i32 - 1));
+            self.cursor.point.column = Column(new_cursor_col);
+        }
+        self.cursor.input_needs_wrap = false;
+
+        if let Some(di) = new_saved_deque {
+            let di = di.saturating_sub(trimmed);
+            let line = di as i32 - new_screen_top as i32;
+            self.saved_cursor.point.line =
+                Line(line.clamp(0, self.screen_lines as i32 - 1));
+            self.saved_cursor.point.column = Column(new_saved_col);
+        }
+
+        self.display_offset = self.display_offset.min(self.history_size());
+    }
+
+    // ---------------------------------------------------------------------
+    // Resize
     // ---------------------------------------------------------------------
 
     pub fn resize(&mut self, cols: usize, lines: usize) {
@@ -818,5 +964,144 @@ mod tests {
         g.template_mut().flags.insert(Flags::BOLD);
         g.input('x', true);
         assert!(g[Line(0)].cells[0].flags.contains(Flags::BOLD));
+    }
+
+    // --- Reflow tests ---
+
+    #[test]
+    fn reflow_shrink_splits_long_line() {
+        // Use a 1-row screen + scrollback so both halves are accessible.
+        let mut g = Grid::new(10, 1, 100);
+        for ch in "abcdefghij".chars() {
+            g.input(ch, true);
+        }
+        g.reflow(5);
+        assert_eq!(g.columns(), 5);
+        // After reflow: "abcde" (wrapped) in scrollback, "fghij" on screen.
+        // Cursor was at col 9 → maps to row 1 col 4 → Line(0) = "fghij".
+        let text0: String = g[Line(0)].cells.iter().take(5).map(|c| c.c).collect();
+        assert_eq!(text0, "fghij");
+        assert!(!g[Line(0)].wrapped);
+        // Scrollback row has "abcde" (wrapped).
+        let text_sb: String = g[Line(-1)].cells.iter().take(5).map(|c| c.c).collect();
+        assert_eq!(text_sb, "abcde");
+        assert!(g[Line(-1)].wrapped);
+    }
+
+    #[test]
+    fn reflow_grow_merges_wrapped_lines() {
+        let mut g = Grid::new(5, 3, 100);
+        // Write 10 chars → wraps at col 5
+        for ch in "abcdefghij".chars() {
+            g.input(ch, true);
+        }
+        assert!(g[Line(0)].wrapped);
+        g.reflow(10);
+        let text: String = g[Line(0)].cells.iter().take(10).map(|c| c.c).collect();
+        assert_eq!(text, "abcdefghij");
+        assert!(!g[Line(0)].wrapped);
+    }
+
+    #[test]
+    fn reflow_cursor_tracking_shrink() {
+        // 10-col, 2-row screen so both halves fit.
+        let mut g = Grid::new(10, 2, 100);
+        for ch in "abcdefghij".chars() {
+            g.input(ch, true);
+        }
+        g.goto(Line(0), Column(7));
+        g.reflow(5);
+        // Offset 7 in a 10-char line → row 1 col 2 in 5-col grid.
+        // But screen is 2 rows: "abcde" goes to scrollback, "fghij" is Line(0),
+        // and Line(1) is blank. Cursor offset 7 = row 1 in the logical → Line(0) col 2.
+        assert_eq!(g.cursor.point.line.0, 0);
+        assert_eq!(g.cursor.point.column.0, 2);
+    }
+
+    #[test]
+    fn reflow_cursor_tracking_grow() {
+        let mut g = Grid::new(5, 3, 100);
+        for ch in "abcdefghij".chars() {
+            g.input(ch, true);
+        }
+        // Cursor after writing is on row 1. Move to row 1 col 2.
+        g.goto(Line(1), Column(2));
+        g.reflow(10);
+        // Offset = 5 + 2 = 7 → row 0 col 7 in 10-col grid
+        assert_eq!(g.cursor.point.line.0, 0);
+        assert_eq!(g.cursor.point.column.0, 7);
+    }
+
+    #[test]
+    fn reflow_preserves_non_wrapped_short_lines() {
+        let mut g = Grid::new(10, 3, 100);
+        for ch in "abc".chars() {
+            g.input(ch, true);
+        }
+        g.line_feed();
+        g.carriage_return();
+        for ch in "xyz".chars() {
+            g.input(ch, true);
+        }
+        g.reflow(5);
+        // Two short lines should NOT merge — they weren't wrapped.
+        let t0: String = g[Line(0)].cells.iter().take(3).map(|c| c.c).collect();
+        let t1: String = g[Line(1)].cells.iter().take(3).map(|c| c.c).collect();
+        assert_eq!(t0, "abc");
+        assert_eq!(t1, "xyz");
+        assert!(!g[Line(0)].wrapped);
+    }
+
+    #[test]
+    fn reflow_preserves_blank_lines() {
+        let mut g = Grid::new(10, 5, 100);
+        for ch in "hello".chars() {
+            g.input(ch, true);
+        }
+        g.line_feed();
+        g.carriage_return();
+        // blank line
+        g.line_feed();
+        g.carriage_return();
+        for ch in "world".chars() {
+            g.input(ch, true);
+        }
+        g.reflow(5);
+        let t0: String = g[Line(0)].cells.iter().take(5).map(|c| c.c).collect();
+        assert_eq!(t0, "hello");
+        assert_eq!(g[Line(1)].occupied_len(), 0); // blank line preserved
+        let t2: String = g[Line(2)].cells.iter().take(5).map(|c| c.c).collect();
+        assert_eq!(t2, "world");
+    }
+
+    #[test]
+    fn reflow_same_cols_is_noop() {
+        let mut g = Grid::new(10, 3, 100);
+        for ch in "hello".chars() {
+            g.input(ch, true);
+        }
+        g.reflow(10);
+        let text: String = g[Line(0)].cells.iter().take(5).map(|c| c.c).collect();
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn reflow_scrollback_rows() {
+        let mut g = Grid::new(10, 2, 100);
+        g.goto(Line(1), Column(0));
+        // Push some content into scrollback
+        for ch in "abcdefghij".chars() {
+            g.input(ch, true);
+        }
+        g.line_feed();
+        g.carriage_return();
+        for ch in "klmnopqrst".chars() {
+            g.input(ch, true);
+        }
+        g.line_feed(); // scrolls: "abcdefghij" goes to scrollback
+        // Now reflow scrollback from 10 to 5
+        g.reflow(5);
+        // Scrollback should have "abcde" (wrapped) + "fghij" (not wrapped)
+        assert!(g.history_size() >= 2);
     }
 }

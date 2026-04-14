@@ -45,6 +45,13 @@ impl Default for Cell {
 }
 
 impl Cell {
+    /// Returns true if this cell is identical to a fresh default cell (space
+    /// with default foreground/background and no flags). Used by reflow to
+    /// trim trailing padding.
+    pub fn is_default(&self) -> bool {
+        *self == Cell::default()
+    }
+
     /// Reset the cell to a blank with the given template's colours and flags.
     /// Used when clearing a region so the erased cells pick up the current
     /// background colour (important for SGR-set backgrounds).

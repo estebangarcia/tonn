@@ -235,8 +235,10 @@ pub fn read_grid_content<T: EventListener>(
     let mut spans: Vec<ColoredSpan> = Vec::new();
     let mut bg_cells: Vec<BgCell> = Vec::new();
 
+    // `Line(0)` is the top of the visible screen — `grid[Line]` already
+    // accounts for `display_offset`, so iterate 0..screen_lines directly.
     for line_idx in 0..num_lines {
-        let row = &grid[Line(line_idx as i32 - display_offset as i32)];
+        let row = &grid[Line(line_idx as i32)];
 
         // Build spans by grouping consecutive cells with the same color
         let mut current_text = String::new();
