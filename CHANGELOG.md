@@ -1,3 +1,17 @@
+## [1.1.0](https://github.com/estebangarcia/tonn/compare/v1.0.4...v1.1.0) (2026-04-14)
+
+### Features
+
+* implement reflow ([15d5e15](https://github.com/estebangarcia/tonn/commit/15d5e15bf16399234ffe6de69092ee2d86ebdac4))
+* replace alacritty_terminal with our own emulator ([d019c48](https://github.com/estebangarcia/tonn/commit/d019c48a0a391852b278862c0886eed910a4fba2))
+
+### Bug Fixes
+
+* adding app icon ([3953a3c](https://github.com/estebangarcia/tonn/commit/3953a3c89044745a539070e444bc3917c3e37e4c))
+* mark panes as dirty on tab close ([4bf69f8](https://github.com/estebangarcia/tonn/commit/4bf69f8b7481a1a8b529e9d7fbc8840dffcd4a3d))
+* release is manual. react on scale factor changes ([15ea360](https://github.com/estebangarcia/tonn/commit/15ea3603936cd285bfdec6fbc8f0f4f5b5a58182))
+* zoom-in pane stays when switching tab. resizing window or pane keeps history on the same posiiton ([36d9963](https://github.com/estebangarcia/tonn/commit/36d9963152cc3becbf502d9f6a4aa7372a3fb8bf))
+
 ## [1.0.4](https://github.com/estebangarcia/tonn/compare/v1.0.3...v1.0.4) (2026-04-08)
 
 ### Bug Fixes
