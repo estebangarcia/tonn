@@ -12,6 +12,7 @@ pub mod grid;
 pub mod index;
 pub mod mode;
 pub mod parser;
+pub mod search;
 pub mod selection;
 pub mod term;
 

@@ -11,6 +11,7 @@ use crate::grid::{Cursor, Dimensions, Grid};
 #[cfg_attr(not(test), allow(unused_imports))]
 use crate::index::{Column, Line, Point};
 use crate::mode::TermMode;
+use crate::search::SearchState;
 use crate::selection::Selection;
 
 pub struct Term<L: EventListener> {
@@ -20,6 +21,8 @@ pub struct Term<L: EventListener> {
     current_title: Option<String>,
     title_stack: Vec<Option<String>>,
     pub selection: Option<Selection>,
+    /// Open text search (Cmd+F / Ctrl+Shift+F), if any.
+    pub search: Option<SearchState>,
     /// Saved cursor state for the inactive (non-alt) screen, used by
     /// DECSET/DECRST 1049 so entering and leaving alt-screen preserves the
     /// main-screen cursor.
@@ -42,6 +45,7 @@ impl<L: EventListener> Term<L> {
             current_title: None,
             title_stack: Vec::new(),
             selection: None,
+            search: None,
             saved_cursor_main: Cursor::default(),
             saved_cursor_alt: Cursor::default(),
             selection_scroll_mark: 0,
@@ -73,6 +77,10 @@ impl<L: EventListener> Term<L> {
         let cols = dim.columns();
         let lines = dim.screen_lines();
         self.selection = None;
+        // Re-wrapping moves text, so the current match's position is stale.
+        if let Some(search) = &mut self.search {
+            search.clear_current();
+        }
 
         // Reflow the main grid (never the alt grid — apps like vim
         // manage their own layout). When ALT_SCREEN is active, self.grid
@@ -195,8 +203,9 @@ impl<L: EventListener> Term<L> {
 
         std::mem::swap(&mut self.grid, &mut self.alt_grid);
         self.mode.set(TermMode::ALT_SCREEN, to_alt);
-        // A selection made on one screen means nothing on the other.
+        // A selection or search on one screen means nothing on the other.
         self.selection = None;
+        self.search = None;
         self.selection_scroll_mark = self.grid.rows_scrolled_off();
 
         if to_alt {
@@ -215,10 +224,11 @@ impl<L: EventListener> Term<L> {
         }
     }
 
-    /// Keep the selection on its content after output scrolled rows off the
-    /// top of the screen (the viewport stays anchored while scrolled back, so
-    /// the highlight stays on the same text). Called after each parsed chunk.
-    /// A selection whose rows were evicted from history is dropped.
+    /// Keep the selection and the current search match on their content after
+    /// output scrolled rows off the top of the screen (the viewport stays
+    /// anchored while scrolled back, so highlights stay on the same text).
+    /// Called after each parsed chunk. A selection whose rows were evicted
+    /// from history is dropped.
     pub(crate) fn sync_selection_with_scroll(&mut self) {
         let scrolled_off = self.grid.rows_scrolled_off();
         let moved = scrolled_off.wrapping_sub(self.selection_scroll_mark);
@@ -227,6 +237,9 @@ impl<L: EventListener> Term<L> {
             return;
         }
         let oldest_line = -(self.grid.history_size() as i32);
+        if let Some(search) = &mut self.search {
+            search.rotate(moved.min(i32::MAX as usize) as i32, oldest_line);
+        }
         if let Some(sel) = &mut self.selection {
             sel.rotate(-(moved.min(i32::MAX as usize) as i32));
             if sel.start.point.line.0.max(sel.end.point.line.0) < oldest_line {

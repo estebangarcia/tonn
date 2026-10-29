@@ -26,6 +26,16 @@ pub const FONT_SIZE_STEP: f32 = 1.0;
 // Focus border geometry (not a color — stays as a constant)
 const FOCUS_BORDER_THICKNESS: f32 = 2.0;
 
+// Search: match highlights are the theme accent, translucent so the cell
+// background and text stay readable in every theme.
+const SEARCH_MATCH_ALPHA: f32 = 0.35;
+const SEARCH_CURRENT_MATCH_ALPHA: f32 = 0.8;
+/// Width of the search bar in cells (narrower panes use their full width).
+const SEARCH_BAR_COLUMNS: usize = 36;
+const SEARCH_BAR_PREFIX: &str = " Find: ";
+const SEARCH_BAR_CARET: char = '\u{2588}';
+const SEARCH_BAR_ELLIPSIS: char = '…';
+
 // Tab bar layout (logical pixels, scaled by DPI at runtime)
 const TAB_GAP_LOGICAL: f32 = 4.0;
 const MAX_TAB_WIDTH_LOGICAL: f32 = 180.0;
@@ -127,30 +137,90 @@ impl ScrollPosition {
     }
 }
 
-/// The scroll-position badge over a pane's top-right cells.
-struct ScrollBadge {
+/// A highlighted search-match cell, in viewport coordinates.
+pub struct SearchCell {
+    pub row: usize,
+    pub col: usize,
+    /// Part of the match currently navigated to.
+    pub current: bool,
+}
+
+/// An open search bar on a pane.
+pub struct SearchBar {
+    pub query: String,
+    /// `3/17`, `No matches`, or empty.
+    pub status: String,
+}
+
+impl SearchBar {
+    /// The bar's text, exactly `width` columns: ` Find: query█   3/17 `. A
+    /// long query is cut from the left so the end being typed stays visible.
+    fn label(&self, width: usize) -> String {
+        let status = if self.status.is_empty() { String::new() } else { format!(" {} ", self.status) };
+        let fixed = SEARCH_BAR_PREFIX.chars().count() + 1 + status.chars().count();
+        let room = width.saturating_sub(fixed);
+        let query_len = self.query.chars().count();
+        let query: String = if query_len <= room {
+            self.query.clone()
+        } else if room == 0 {
+            String::new()
+        } else {
+            let tail: String = self.query.chars().skip(query_len - (room - 1)).collect();
+            format!("{SEARCH_BAR_ELLIPSIS}{tail}")
+        };
+        let left = format!("{SEARCH_BAR_PREFIX}{query}{SEARCH_BAR_CARET}");
+        let padding = width.saturating_sub(left.chars().count() + status.chars().count());
+        format!("{left}{}{status}", " ".repeat(padding)).chars().take(width).collect()
+    }
+}
+
+/// What a pane's corner label shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CornerLabelKind {
+    SearchBar,
+    ScrollBadge,
+}
+
+/// A one-row label over a pane's top-right cells: the search bar while a
+/// search is open, otherwise the scroll-position badge while scrolled back.
+struct CornerLabel {
+    kind: CornerLabelKind,
     label: String,
     x: f32,
     y: f32,
     width: f32,
 }
 
-impl ScrollBadge {
-    /// Place the badge on the pane's first row, right-aligned to the last
-    /// cell column, or `None` if the pane isn't scrolled back or is too narrow.
+impl CornerLabel {
+    /// Place the label on the pane's first row, right-aligned to the last
+    /// cell column, or `None` if there's nothing to show or no room.
     fn for_pane(pane: &PaneContent, cell_width: f32) -> Option<Self> {
-        let label = pane.scroll_position?.label();
         let columns = ((pane.width - PADDING * 2.0) / cell_width).floor().max(0.0) as usize;
+        let (kind, label) = match (&pane.search_bar, pane.scroll_position) {
+            (Some(bar), _) => (CornerLabelKind::SearchBar, bar.label(columns.min(SEARCH_BAR_COLUMNS))),
+            (None, Some(position)) => (CornerLabelKind::ScrollBadge, position.label()),
+            (None, None) => return None,
+        };
         let label_cols = label.chars().count();
-        if label_cols > columns {
+        if label_cols == 0 || label_cols > columns {
             return None;
         }
         Some(Self {
+            kind,
             x: pane.x + PADDING + (columns - label_cols) as f32 * cell_width,
             y: pane.y + PADDING,
             width: label_cols as f32 * cell_width,
             label,
         })
+    }
+
+    /// (background, text) colours: the badge is the theme inverted, the
+    /// search bar uses the active-tab colours.
+    fn colors(&self, theme: &Theme) -> ([u8; 3], [u8; 3]) {
+        match self.kind {
+            CornerLabelKind::ScrollBadge => (theme.fg, theme.bg),
+            CornerLabelKind::SearchBar => (theme.tab_active_bg, theme.tab_active_text),
+        }
     }
 }
 
@@ -172,6 +242,10 @@ pub struct PaneContent {
     pub needs_reshape: bool,
     /// Set while scrolled back; draws a `[offset/history]` badge.
     pub scroll_position: Option<ScrollPosition>,
+    /// Search matches in view (empty when no search is open).
+    pub search_cells: Vec<SearchCell>,
+    /// Set while a search is open on this pane; replaces the scroll badge.
+    pub search_bar: Option<SearchBar>,
 }
 
 /// An overlay panel (e.g., tab switcher).
@@ -294,8 +368,8 @@ pub struct Renderer {
     measured_cell_width: Option<f32>,
     // Per-pane text buffers (reused across frames)
     pane_buffers: HashMap<PaneId, Buffer>,
-    /// Per-pane scroll-position badge text.
-    scroll_badge_buffers: HashMap<PaneId, Buffer>,
+    /// Per-pane corner label text (search bar / scroll badge).
+    corner_label_buffers: HashMap<PaneId, Buffer>,
     cursor_buffer: Buffer,
     tab_buffers: Vec<Buffer>,
     overlay_buffer: Buffer,
@@ -448,7 +522,7 @@ impl Renderer {
             font_family,
             measured_cell_width: None,
             pane_buffers: HashMap::new(),
-            scroll_badge_buffers: HashMap::new(),
+            corner_label_buffers: HashMap::new(),
             cursor_buffer,
             tab_buffers: Vec::new(),
             overlay_buffer,
@@ -636,7 +710,7 @@ impl Renderer {
     /// Remove buffers for panes that no longer exist.
     pub fn cleanup_pane_buffers(&mut self, active_pane_ids: &[PaneId]) {
         self.pane_buffers.retain(|id, _| active_pane_ids.contains(id));
-        self.scroll_badge_buffers.retain(|id, _| active_pane_ids.contains(id));
+        self.corner_label_buffers.retain(|id, _| active_pane_ids.contains(id));
     }
 
     /// Render a complete frame with tab bar, multiple panes, dividers, and optional overlays.
@@ -668,8 +742,8 @@ impl Renderer {
         let sw = self.surface_config.width as i32;
         let sh = self.surface_config.height as i32;
 
-        let scroll_badges: HashMap<PaneId, ScrollBadge> = panes.iter()
-            .filter_map(|pane| Some((pane.pane_id, ScrollBadge::for_pane(pane, cw)?)))
+        let corner_labels: HashMap<PaneId, CornerLabel> = panes.iter()
+            .filter_map(|pane| Some((pane.pane_id, CornerLabel::for_pane(pane, cw)?)))
             .collect();
 
         // --- Build all rect vertices (bg cells + selection + dividers + focus borders) ---
@@ -697,6 +771,15 @@ impl Renderer {
                     all_rect_vertices.extend_from_slice(&self.build_rect_vertices(x0, y0, cw, lh, color));
                 }
 
+                // Search matches (translucent accent; the current one stronger)
+                for cell in &pane.search_cells {
+                    let mut color = Self::color3(self.theme.focus_border);
+                    color[3] = if cell.current { SEARCH_CURRENT_MATCH_ALPHA } else { SEARCH_MATCH_ALPHA };
+                    let x0 = ox + PADDING + cell.col as f32 * cw;
+                    let y0 = oy + PADDING + cell.row as f32 * lh;
+                    all_rect_vertices.extend_from_slice(&self.build_rect_vertices(x0, y0, cw, lh, color));
+                }
+
                 // Selection cells
                 let sel_color = Self::color3(self.theme.selection);
                 for cell in &pane.selection_cells {
@@ -705,12 +788,12 @@ impl Renderer {
                     all_rect_vertices.extend_from_slice(&self.build_rect_vertices(x0, y0, cw, lh, sel_color));
                 }
 
-                // Scroll-position badge background (inverted theme colours),
-                // after the cell backgrounds so it sits on top of them.
-                if let Some(badge) = scroll_badges.get(&pane.pane_id) {
-                    let badge_bg = Self::color3(self.theme.fg);
+                // Corner label background, after the cell backgrounds and
+                // highlights so it sits on top of them.
+                if let Some(label) = corner_labels.get(&pane.pane_id) {
+                    let (label_bg, _) = label.colors(&self.theme);
                     all_rect_vertices.extend_from_slice(
-                        &self.build_rect_vertices(badge.x, badge.y, badge.width, lh, badge_bg),
+                        &self.build_rect_vertices(label.x, label.y, label.width, lh, Self::color3(label_bg)),
                     );
                 }
 
@@ -823,20 +906,21 @@ impl Renderer {
                 self.cursor_buffer.shape_until_scroll(&mut self.font_system, false);
             }
 
-            if let Some(badge) = scroll_badges.get(&pane.pane_id) {
-                let badge_buf = self.scroll_badge_buffers.entry(pane.pane_id).or_insert_with(|| {
+            if let Some(label) = corner_labels.get(&pane.pane_id) {
+                let (_, label_text) = label.colors(&self.theme);
+                let label_buf = self.corner_label_buffers.entry(pane.pane_id).or_insert_with(|| {
                     Buffer::new(&mut self.font_system, metrics)
                 });
-                badge_buf.set_metrics(&mut self.font_system, metrics);
-                badge_buf.set_size(&mut self.font_system, Some(badge.width), Some(lh));
-                badge_buf.set_text(
+                label_buf.set_metrics(&mut self.font_system, metrics);
+                label_buf.set_size(&mut self.font_system, Some(label.width), Some(lh));
+                label_buf.set_text(
                     &mut self.font_system,
-                    &badge.label,
-                    &default_attrs.clone().color(glyphon_rgb(self.theme.bg)),
+                    &label.label,
+                    &default_attrs.clone().color(glyphon_rgb(label_text)),
                     Shaping::Advanced,
                     None,
                 );
-                badge_buf.shape_until_scroll(&mut self.font_system, false);
+                label_buf.shape_until_scroll(&mut self.font_system, false);
             }
         }
 
@@ -863,40 +947,40 @@ impl Renderer {
                         bottom: ((pane.y + pane.height) as i32).min(sh),
                     };
 
-                    match scroll_badges.get(&pane.pane_id) {
+                    match corner_labels.get(&pane.pane_id) {
                         None => text_areas.push(pane_text(full)),
-                        Some(badge) => {
-                            // Draw the pane text around the badge so glyphs
-                            // under it don't overlap the label: everything
-                            // below the badge row, then the badge row up to
-                            // the badge's left edge.
-                            let badge_bottom = (badge.y + lh) as i32;
-                            text_areas.push(pane_text(TextBounds { top: badge_bottom, ..full }));
+                        Some(label) => {
+                            // Draw the pane text around the label so glyphs
+                            // under it don't overlap it: everything below
+                            // the label row, then the label row up to the
+                            // label's left edge.
+                            let label_bottom = (label.y + lh) as i32;
+                            text_areas.push(pane_text(TextBounds { top: label_bottom, ..full }));
                             text_areas.push(pane_text(TextBounds {
-                                right: (badge.x as i32).min(full.right),
-                                bottom: badge_bottom,
+                                right: (label.x as i32).min(full.right),
+                                bottom: label_bottom,
                                 ..full
                             }));
                         }
                     }
                 }
 
-                if let (Some(badge), Some(badge_buf)) = (
-                    scroll_badges.get(&pane.pane_id),
-                    self.scroll_badge_buffers.get(&pane.pane_id),
+                if let (Some(label), Some(label_buf)) = (
+                    corner_labels.get(&pane.pane_id),
+                    self.corner_label_buffers.get(&pane.pane_id),
                 ) {
                     text_areas.push(TextArea {
-                        buffer: badge_buf,
-                        left: badge.x,
-                        top: badge.y,
+                        buffer: label_buf,
+                        left: label.x,
+                        top: label.y,
                         scale: 1.0,
                         bounds: TextBounds {
-                            left: (badge.x as i32).max(0),
-                            top: (badge.y as i32).max(0),
-                            right: ((badge.x + badge.width) as i32).min(sw),
-                            bottom: ((badge.y + lh) as i32).min(sh),
+                            left: (label.x as i32).max(0),
+                            top: (label.y as i32).max(0),
+                            right: ((label.x + label.width) as i32).min(sw),
+                            bottom: ((label.y + lh) as i32).min(sh),
                         },
-                        default_color: glyphon_rgb(self.theme.bg),
+                        default_color: glyphon_rgb(label.colors(&self.theme).1),
                         custom_glyphs: &[],
                     });
                 }
@@ -1711,13 +1795,15 @@ mod tests {
             bell_active: false,
             needs_reshape: false,
             scroll_position,
+            search_cells: Vec::new(),
+            search_bar: None,
         }
     }
 
     #[test]
     fn no_badge_at_the_bottom() {
         assert_eq!(ScrollPosition::scrolled_back(0, 500), None);
-        assert!(ScrollBadge::for_pane(&pane(400.0, None), CELL_W).is_none());
+        assert!(CornerLabel::for_pane(&pane(400.0, None), CELL_W).is_none());
     }
 
     #[test]
@@ -1729,16 +1815,44 @@ mod tests {
     #[test]
     fn badge_is_right_aligned_on_the_first_row() {
         // (400 - 2 × PADDING) / 10 = 38 columns; "[3/10]" is 6 wide → col 32.
-        let badge = ScrollBadge::for_pane(&pane(400.0, ScrollPosition::scrolled_back(3, 10)), CELL_W).unwrap();
+        let badge = CornerLabel::for_pane(&pane(400.0, ScrollPosition::scrolled_back(3, 10)), CELL_W).unwrap();
         assert_eq!(badge.x, 100.0 + PADDING + 32.0 * CELL_W);
         assert_eq!(badge.y, 50.0 + PADDING);
         assert_eq!(badge.width, 6.0 * CELL_W);
+    }
+
+    fn search_bar(query: &str, status: &str) -> SearchBar {
+        SearchBar { query: query.into(), status: status.into() }
+    }
+
+    #[test]
+    fn search_bar_label_fills_its_width() {
+        let label = search_bar("error", "3/17").label(30);
+        assert_eq!(label.chars().count(), 30);
+        assert!(label.starts_with(" Find: error\u{2588}"));
+        assert!(label.ends_with(" 3/17 "));
+    }
+
+    #[test]
+    fn long_query_keeps_its_end_visible() {
+        let label = search_bar("a-very-long-search-query-that-overflows", "1/2").label(24);
+        assert_eq!(label.chars().count(), 24);
+        assert!(label.contains("…") && label.contains("overflows\u{2588}"), "{label:?}");
+    }
+
+    #[test]
+    fn search_bar_replaces_the_scroll_badge() {
+        let mut scrolled = pane(400.0, ScrollPosition::scrolled_back(3, 10));
+        scrolled.search_bar = Some(search_bar("x", ""));
+        let label = CornerLabel::for_pane(&scrolled, CELL_W).unwrap();
+        assert_eq!(label.kind, CornerLabelKind::SearchBar);
+        assert_eq!(label.label.chars().count(), SEARCH_BAR_COLUMNS);
     }
 
     #[test]
     fn no_badge_when_the_pane_is_too_narrow() {
         // 4 columns can't fit "[3/10]".
         let narrow = pane(PADDING * 2.0 + 4.0 * CELL_W, ScrollPosition::scrolled_back(3, 10));
-        assert!(ScrollBadge::for_pane(&narrow, CELL_W).is_none());
+        assert!(CornerLabel::for_pane(&narrow, CELL_W).is_none());
     }
 }

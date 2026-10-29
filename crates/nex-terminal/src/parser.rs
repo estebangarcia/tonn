@@ -937,6 +937,31 @@ mod tests {
     }
 
     #[test]
+    fn current_search_match_follows_its_text_while_output_streams() {
+        let mut t = term(20, 5);
+        feed_numbered_lines(&mut t, 0..20);
+        let mut search = crate::search::SearchState::default();
+        search.set_query(t.grid_mut(), "line 7".into());
+        t.search = Some(search);
+        let text_of = |t: &Term<NoopListener>| {
+            let current = t.search.as_ref().unwrap().current.unwrap();
+            t.grid().live_row(current.start.line).cells.iter().map(|c| c.c).collect::<String>().trim_end().to_string()
+        };
+        assert_eq!(text_of(&t), "line 7");
+
+        feed_numbered_lines(&mut t, 20..30);
+        assert_eq!(text_of(&t), "line 7", "current match rotated with the scroll");
+    }
+
+    #[test]
+    fn switching_screens_closes_the_search() {
+        let mut t = term(20, 5);
+        t.search = Some(crate::search::SearchState::default());
+        feed(&mut t, b"\x1b[?1049h");
+        assert!(t.search.is_none());
+    }
+
+    #[test]
     fn paste_at_password_prompt_has_no_bracket_markers() {
         // The shell enables bracketed paste while editing the command line
         // and disables it before running the command — so a password prompt

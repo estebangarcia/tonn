@@ -240,6 +240,17 @@ impl Grid {
         }
     }
 
+    /// Scroll the viewport so live `line` is visible, centring it if it isn't
+    /// already on screen.
+    pub fn reveal_line(&mut self, line: Line) {
+        let viewport_row = line.0 + self.display_offset as i32;
+        if (0..self.screen_lines as i32).contains(&viewport_row) {
+            return;
+        }
+        let centred = (self.screen_lines as i32 / 2 - line.0).clamp(0, self.history_size() as i32);
+        self.scroll_display(Scroll::Delta(centred - self.display_offset as i32));
+    }
+
     /// History rows to retain: `history_limit`, plus a held allowance while
     /// scrolled back (see `MAX_HELD_HISTORY_ROWS`).
     fn retained_history(&self) -> usize {

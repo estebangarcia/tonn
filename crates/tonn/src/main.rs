@@ -16,7 +16,7 @@ use winit::window::{Window, WindowId};
 
 use nex_common::{PaneId, CELL_WIDTH_RATIO, LINE_HEIGHT_RATIO, PADDING};
 use nex_mux::{Mux, MuxEventProxy, Pane, Rect, SplitDirection, DEFAULT_TAB_TITLE};
-use nex_render::renderer::{BgCell, PaneContent, Renderer, RenderSpan, ScrollPosition, SelectionCell, SettingsFieldType, DEFAULT_FONT_SIZE, FONT_SIZE_STEP};
+use nex_render::renderer::{BgCell, PaneContent, Renderer, RenderSpan, ScrollPosition, SearchBar, SearchCell, SelectionCell, SettingsFieldType, DEFAULT_FONT_SIZE, FONT_SIZE_STEP};
 
 // UI constants
 const APP_TITLE: &str = "Tonn";
@@ -49,6 +49,7 @@ use nex_terminal::{
     read_grid_content,
 };
 use nex_terminal::mouse::{self, MouseButton as TermMouseButton, MouseEvent, MouseEventKind, WheelAction};
+use nex_terminal::search::{SearchDirection, SearchState};
 
 // ---------------------------------------------------------------------------
 // UserEvent + MuxEventProxy bridge
@@ -732,6 +733,52 @@ impl App {
         if pane.terminal.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
             write_to_pane(pane, mouse::focus_report(focused));
         }
+    }
+
+    /// Open the search bar on the focused pane (an open one stays as it is).
+    fn open_search(&self) {
+        if let Some(pane) = self.mux.as_ref().and_then(|m| m.focused_pane()) {
+            pane.terminal.lock().search.get_or_insert_with(SearchState::default);
+        }
+    }
+
+    /// Whether the focused pane has its search bar open.
+    fn focused_search_open(&self) -> bool {
+        self.mux.as_ref()
+            .and_then(|m| m.focused_pane())
+            .is_some_and(|pane| pane.terminal.lock().search.is_some())
+    }
+
+    /// Apply a search-bar key action to the focused pane's search.
+    fn apply_search_action(&self, action: SearchKeyAction) {
+        let Some(pane) = self.mux.as_ref().and_then(|m| m.focused_pane()) else { return };
+        let mut term = pane.terminal.lock();
+        // Taken out so it can borrow the grid mutably; put back unless closed.
+        let Some(mut search) = term.search.take() else { return };
+
+        let edited_query = match action {
+            SearchKeyAction::Close => return,
+            SearchKeyAction::Step(direction) => {
+                search.step(term.grid_mut(), direction);
+                None
+            }
+            SearchKeyAction::DeleteChar => {
+                let mut query = search.query.clone();
+                query.pop();
+                Some(query)
+            }
+            // Only the first line — the bar is single-line.
+            SearchKeyAction::Paste => clipboard_text()
+                .and_then(|pasted| pasted.lines().next().map(|line| format!("{}{line}", search.query))),
+            SearchKeyAction::Type(typed) => Some(format!("{}{typed}", search.query)),
+            SearchKeyAction::Shortcut | SearchKeyAction::Ignore => None,
+        };
+        if let Some(query) = edited_query {
+            search.set_query(term.grid_mut(), query);
+        }
+        term.search = Some(search);
+        // Stepping or typing may have scrolled the viewport: reshape the text.
+        pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Typing or pasting into the focused pane jumps back to the live screen.
@@ -1467,17 +1514,38 @@ impl App {
             return;
         }
 
-        // --- Paste (Cmd+V / Ctrl+Shift+V) ---
-        if matches!(logical_key, Key::Character(c) if c.as_str() == "v")
-            && (super_key || (ctrl && shift))
-        {
-            if let Ok(mut clipboard) = arboard::Clipboard::new()
-                && let Ok(text) = clipboard.get_text() {
-                    let mode = self.focused_mode().unwrap_or_default();
-                    if self.write_to_focused(&nex_terminal::paste::encode(&text, mode)) {
-                        self.scroll_focused_to_bottom();
+        // --- Search (Cmd+F / Ctrl+Shift+F); while open, the bar takes typing ---
+        if is_search_shortcut(logical_key, super_key, ctrl, shift) {
+            self.open_search();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return;
+        }
+        let search_open = self.focused_search_open();
+        if search_open {
+            match search_key_action(logical_key, text, super_key, ctrl, shift) {
+                // Let Tonn's shortcut handlers below run; the PTY stays shut
+                // (`key_reaches_terminal`).
+                SearchKeyAction::Shortcut => {}
+                action => {
+                    self.apply_search_action(action);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
                     }
+                    return;
                 }
+            }
+        }
+
+        // --- Paste (Cmd+V / Ctrl+Shift+V) ---
+        if is_paste_shortcut(logical_key, super_key, ctrl, shift) {
+            if let Some(text) = clipboard_text() {
+                let mode = self.focused_mode().unwrap_or_default();
+                if self.write_to_focused(&nex_terminal::paste::encode(&text, mode)) {
+                    self.scroll_focused_to_bottom();
+                }
+            }
             return;
         }
 
@@ -1615,6 +1683,9 @@ impl App {
 
 
         // --- PTY input ---
+        if !key_reaches_terminal(logical_key, super_key, search_open) {
+            return;
+        }
         let key_input = map_winit_key(logical_key, text);
         let wrote = if let Some(ref key_input) = key_input {
             let mods = self.key_modifiers();
@@ -1674,6 +1745,67 @@ fn map_winit_key(key: &Key, text: Option<&str>) -> Option<nex_terminal::keys::Ke
         Key::Character(c) => c.chars().next().map(K::Char),
         _ => text.and_then(|t| t.chars().next()).map(K::Char),
     }
+}
+
+/// The "open search" shortcut: Cmd+F on macOS, Ctrl+Shift+F elsewhere (plain
+/// Ctrl+F belongs to the shell — forward-char — and apps like less/vim).
+fn is_search_shortcut(key: &Key, super_key: bool, ctrl: bool, shift: bool) -> bool {
+    let is_f = matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("f"));
+    is_f && if cfg!(target_os = "macos") { super_key } else { ctrl && shift }
+}
+
+/// What a key press does while the focused pane's search bar is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchKeyAction {
+    Close,
+    Step(SearchDirection),
+    DeleteChar,
+    Paste,
+    Type(String),
+    /// A possible Tonn shortcut (Cmd+…, Ctrl+Shift+…): the shortcut handlers
+    /// get it, the terminal never does.
+    Shortcut,
+    /// Swallowed so it can't reach the shell behind the bar.
+    Ignore,
+}
+
+/// Classify a key press for an open search bar. Enter / F3 (and Cmd+G on
+/// macOS) step to older matches, with Shift to newer ones.
+fn search_key_action(key: &Key, text: Option<&str>, super_key: bool, ctrl: bool, shift: bool) -> SearchKeyAction {
+    let direction = if shift { SearchDirection::Newer } else { SearchDirection::Older };
+    let is_step_shortcut = cfg!(target_os = "macos") && super_key
+        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("g"));
+    match key {
+        Key::Named(NamedKey::Escape) => SearchKeyAction::Close,
+        Key::Named(NamedKey::Enter | NamedKey::F3) => SearchKeyAction::Step(direction),
+        _ if is_step_shortcut => SearchKeyAction::Step(direction),
+        Key::Named(NamedKey::Backspace) => SearchKeyAction::DeleteChar,
+        _ if is_paste_shortcut(key, super_key, ctrl, shift) => SearchKeyAction::Paste,
+        _ if super_key || (ctrl && shift) => SearchKeyAction::Shortcut,
+        _ if ctrl => SearchKeyAction::Ignore,
+        _ => match text.filter(|t| !t.is_empty() && !t.chars().any(char::is_control)) {
+            Some(typed) => SearchKeyAction::Type(typed.to_string()),
+            None => SearchKeyAction::Ignore,
+        },
+    }
+}
+
+/// Whether a key press that no Tonn shortcut handled may be sent to the
+/// terminal. Never while a search bar is open (it owns the keyboard), and
+/// never a Cmd/Super+character: Cmd isn't a terminal modifier, so an unbound
+/// Cmd+A would otherwise type a plain `a`.
+fn key_reaches_terminal(key: &Key, super_key: bool, search_open: bool) -> bool {
+    let cmd_character = super_key && matches!(key, Key::Character(_));
+    !(search_open || cmd_character)
+}
+
+/// Paste shortcut: Cmd+V, or Ctrl+Shift+V.
+fn is_paste_shortcut(key: &Key, super_key: bool, ctrl: bool, shift: bool) -> bool {
+    matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("v")) && (super_key || (ctrl && shift))
+}
+
+fn clipboard_text() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get_text().ok()
 }
 
 /// Convert a winit mouse button into the terminal's mouse-report button.
@@ -2019,6 +2151,20 @@ impl App {
                 .map(|(row, col)| SelectionCell { row, col })
                 .collect();
 
+            let (search_cells, search_bar) = match &term.search {
+                Some(search) => {
+                    let grid = term.grid();
+                    let cells = search.visible_matches(grid).into_iter().flat_map(|found| {
+                        let current = search.current == Some(found);
+                        found.range()
+                            .viewport_cells(grid.display_offset(), grid.screen_lines(), grid.columns())
+                            .map(move |(row, col)| SearchCell { row, col, current })
+                    }).collect();
+                    (cells, Some(SearchBar { query: search.query.clone(), status: search.status() }))
+                }
+                None => (Vec::new(), None),
+            };
+
             PaneContent {
                 pane_id: pane.id,
                 x: pane.bounds.x,
@@ -2037,6 +2183,8 @@ impl App {
                     term.grid().display_offset(),
                     term.grid().history_size(),
                 ),
+                search_cells,
+                search_bar,
             }
         }).collect();
 
@@ -2456,6 +2604,67 @@ mod tests {
         let step = MouseScrollDelta::LineDelta(0.0, 0.125);
         let total: i32 = (0..8).map(|_| wheel.lines(step, NATIVE)).sum();
         assert_eq!(total, 3);
+    }
+
+    fn character(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    #[test]
+    fn search_shortcut_is_cmd_f_on_macos_and_ctrl_shift_f_elsewhere() {
+        let f = character("f");
+        let shifted_f = character("F");
+        if cfg!(target_os = "macos") {
+            assert!(is_search_shortcut(&f, true, false, false));
+            assert!(!is_search_shortcut(&f, false, true, false), "Ctrl+F stays with the shell");
+        } else {
+            assert!(is_search_shortcut(&shifted_f, false, true, true));
+            assert!(!is_search_shortcut(&f, false, true, false), "Ctrl+F stays with the shell");
+        }
+        assert!(!is_search_shortcut(&f, false, false, false), "plain f is typing");
+    }
+
+    fn action(key: Key, text: Option<&str>, super_key: bool, ctrl: bool, shift: bool) -> SearchKeyAction {
+        search_key_action(&key, text, super_key, ctrl, shift)
+    }
+
+    #[test]
+    fn search_bar_key_actions() {
+        assert_eq!(action(Key::Named(NamedKey::Escape), None, false, false, false), SearchKeyAction::Close);
+        assert_eq!(action(Key::Named(NamedKey::Enter), None, false, false, false), SearchKeyAction::Step(SearchDirection::Older));
+        assert_eq!(action(Key::Named(NamedKey::Enter), None, false, false, true), SearchKeyAction::Step(SearchDirection::Newer));
+        assert_eq!(action(Key::Named(NamedKey::Backspace), None, false, false, false), SearchKeyAction::DeleteChar);
+        assert_eq!(action(character("a"), Some("a"), false, false, false), SearchKeyAction::Type("a".into()));
+        assert_eq!(action(character("A"), Some("A"), false, false, true), SearchKeyAction::Type("A".into()));
+        assert_eq!(action(character("v"), Some("v"), true, false, false), SearchKeyAction::Paste);
+        // Keys that must never be typed into the shell behind the bar.
+        assert_eq!(action(character("c"), Some("\u{3}"), false, true, false), SearchKeyAction::Ignore);
+        assert_eq!(action(Key::Named(NamedKey::ArrowUp), None, false, false, false), SearchKeyAction::Ignore);
+    }
+
+    #[test]
+    fn unbound_shortcuts_while_searching_never_reach_the_terminal() {
+        // Cmd+A / Ctrl+Shift+X go to the shortcut handlers, not the bar…
+        assert_eq!(action(character("a"), Some("a"), true, false, false), SearchKeyAction::Shortcut);
+        assert_eq!(action(character("X"), Some("X"), false, true, true), SearchKeyAction::Shortcut);
+        // …and if none handles them, the terminal is still shut.
+        assert!(!key_reaches_terminal(&character("a"), true, true));
+        assert!(!key_reaches_terminal(&character("X"), false, true));
+    }
+
+    #[test]
+    fn cmd_letter_never_types_into_the_terminal() {
+        assert!(!key_reaches_terminal(&character("a"), true, false));
+        assert!(key_reaches_terminal(&character("a"), false, false), "plain typing");
+        assert!(key_reaches_terminal(&Key::Named(NamedKey::ArrowLeft), true, false), "Cmd+arrows unchanged");
+    }
+
+    #[test]
+    fn paste_shortcut_accepts_shifted_letter() {
+        // Ctrl+Shift+V reports an uppercase "V" on some platforms.
+        assert!(is_paste_shortcut(&character("V"), false, true, true));
+        assert!(is_paste_shortcut(&character("v"), true, false, false));
+        assert!(!is_paste_shortcut(&character("v"), false, true, false));
     }
 
     #[test]
