@@ -6,4 +6,4 @@ mod strip;
 
 pub use classify::classify;
 pub use compress::compress;
-pub use strip::strip_ansi;
+pub use strip::{AnsiStripper, strip_ansi};

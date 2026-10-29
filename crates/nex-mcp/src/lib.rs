@@ -166,6 +166,10 @@ struct BlockSummary {
     summary: String,
     timestamp: String,
     token_estimate: usize,
+    /// Bytes dropped from the middle of a very long command's output; when
+    /// non-zero, counts and key lines describe only the retained part.
+    #[serde(skip_serializing_if = "is_zero")]
+    omitted_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -180,6 +184,10 @@ struct BlockClassified {
     compression_ratio: f32,
     timestamp: String,
     token_estimate: usize,
+    /// Bytes dropped from the middle of a very long command's output; when
+    /// non-zero, counts and key lines describe only the retained part.
+    #[serde(skip_serializing_if = "is_zero")]
+    omitted_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -192,6 +200,10 @@ struct BlockRaw {
     raw_output: String,
     timestamp: String,
     token_estimate: usize,
+    /// Bytes dropped from the middle of a very long command's output; when
+    /// non-zero, counts and key lines describe only the retained part.
+    #[serde(skip_serializing_if = "is_zero")]
+    omitted_bytes: usize,
 }
 
 fn block_to_summary(block: &Block) -> BlockSummary {
@@ -204,6 +216,7 @@ fn block_to_summary(block: &Block) -> BlockSummary {
         summary: block.output.compressed.summary.clone(),
         timestamp: block.timestamp.to_rfc3339(),
         token_estimate: block.token_estimate,
+        omitted_bytes: block.output.omitted_bytes,
     }
 }
 
@@ -219,6 +232,7 @@ fn block_to_classified(block: &Block) -> BlockClassified {
         compression_ratio: block.output.compressed.compression_ratio,
         timestamp: block.timestamp.to_rfc3339(),
         token_estimate: block.token_estimate,
+        omitted_bytes: block.output.omitted_bytes,
     }
 }
 
@@ -232,7 +246,12 @@ fn block_to_raw(block: &Block) -> BlockRaw {
         raw_output: block.output.stripped_text.clone(),
         timestamp: block.timestamp.to_rfc3339(),
         token_estimate: block.token_estimate,
+        omitted_bytes: block.output.omitted_bytes,
     }
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 fn block_by_tier(block: &Block, tier: &str) -> String {
@@ -553,6 +572,7 @@ mod tests {
                     key_lines: vec!["test result: ok".to_string()],
                     compression_ratio: 0.5,
                 },
+                omitted_bytes: 0,
             },
             exit_code: Some(0),
             cwd: PathBuf::from("/tmp"),
@@ -590,6 +610,16 @@ mod tests {
         let raw = block_to_raw(&block);
         assert_eq!(raw.raw_output, "running 5 tests\ntest result: ok");
         assert_eq!(raw.command, "cargo test");
+    }
+
+    #[test]
+    fn every_tier_reports_omitted_output() {
+        let mut block = test_block();
+        assert!(!block_by_tier(&block, "summary").contains("omitted_bytes"), "absent when complete");
+        block.output.omitted_bytes = 1234;
+        for tier in ["summary", "classified", "raw"] {
+            assert!(block_by_tier(&block, tier).contains("\"omitted_bytes\": 1234"), "{tier}");
+        }
     }
 
     #[test]

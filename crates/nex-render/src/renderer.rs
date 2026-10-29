@@ -66,6 +66,8 @@ const SESSION_FONT_SIZE_LOGICAL: f32 = 14.0;
 const SESSION_ENTRY_INSET_LOGICAL: f32 = 4.0;
 const SESSION_ENTRY_GAP_LOGICAL: f32 = 2.0;
 const SESSION_CHAR_WIDTH_RATIO: f32 = 0.6;
+const SESSION_EMPTY_TEXT: &str = "  No sessions found";
+const SESSION_LOADING_TEXT: &str = "  Scanning sessions…";
 
 // Settings overlay layout
 const SETTINGS_PANEL_WIDTH_LOGICAL: f32 = 500.0;
@@ -264,6 +266,8 @@ pub struct SessionOverlay {
     pub entries: Vec<SessionOverlayEntry>,
     pub selected_index: usize,
     pub filter: String,
+    /// Sessions are still being discovered (initial scan running).
+    pub loading: bool,
 }
 
 pub enum SessionEntryKind {
@@ -1466,8 +1470,9 @@ impl Renderer {
             // Empty state message
             if is_empty {
                 rich_spans.push(("\n".to_string(), Attrs::new().family(ui_font)));
+                let empty_text = if session_ov.loading { SESSION_LOADING_TEXT } else { SESSION_EMPTY_TEXT };
                 rich_spans.push((
-                    "  No sessions found".to_string(),
+                    empty_text.to_string(),
                     Attrs::new().family(ui_font).color(glyphon_rgb(self.theme.session_search_placeholder)),
                 ));
             }

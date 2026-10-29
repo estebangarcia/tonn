@@ -216,6 +216,8 @@ fn io_thread<Proxy: MuxEventProxy>(
             }
         }
     }
+    // Let the block processor free this pane's in-progress output buffer.
+    let _ = block_event_tx.send(BlockEvent::PaneClosed { pane_id });
 }
 
 /// Open a per-pane PTY trace file in the temp dir (see `DEBUG_PTY_ENV`).

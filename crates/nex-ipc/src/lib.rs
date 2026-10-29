@@ -28,6 +28,8 @@ pub enum BlockEvent {
         pane_id: PaneId,
         cwd: std::path::PathBuf,
     },
+    /// The pane's shell exited — its in-progress block state can be dropped.
+    PaneClosed { pane_id: PaneId },
 }
 
 /// Max block events buffered before backpressure on I/O threads.

@@ -62,6 +62,8 @@ enum UserEvent {
     Bell(PaneId),
     Redraw,
     McpExecute(nex_mcp::ExecuteCommand),
+    /// The background scan of AI sessions finished.
+    SessionsScanned,
 }
 
 impl std::fmt::Debug for UserEvent {
@@ -73,6 +75,7 @@ impl std::fmt::Debug for UserEvent {
             Self::Bell(id) => write!(f, "Bell({id})"),
             Self::Redraw => write!(f, "Redraw"),
             Self::McpExecute(cmd) => write!(f, "McpExecute({})", cmd.command),
+            Self::SessionsScanned => write!(f, "SessionsScanned"),
         }
     }
 }
@@ -735,6 +738,39 @@ impl App {
         }
     }
 
+    /// A session browser over the current session snapshot.
+    fn new_session_browser(&self) -> Option<SessionBrowser> {
+        let mgr = self.session_manager.as_ref()?;
+        let trees = mgr.session_trees();
+        let active_ids: Vec<String> = self.mux.as_ref()
+            .map(|m| {
+                trees.iter()
+                    .flat_map(|t| {
+                        let mut flat = Vec::new();
+                        for (i, root) in t.roots.iter().enumerate() {
+                            root.flatten(0, i == t.roots.len() - 1, &mut flat);
+                        }
+                        flat.into_iter().filter(|f| m.is_session_active(&f.session.id)).map(|f| f.session.id)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(SessionBrowser::new(trees, active_ids, mgr.provider_names()))
+    }
+
+    /// Rebuild an open session browser from fresh data, keeping its filter
+    /// and tab (it snapshots sessions when opened).
+    fn refresh_session_browser(&mut self) {
+        let Some(old) = self.session_browser.take() else { return };
+        self.session_browser = self.new_session_browser().map(|mut fresh| {
+            fresh.filter = old.filter;
+            fresh.selected_tab = old.selected_tab;
+            fresh.active_only = old.active_only;
+            fresh.apply_filter();
+            fresh
+        });
+    }
+
     /// Open the search bar on the focused pane (an open one stays as it is).
     fn open_search(&self) {
         if let Some(pane) = self.mux.as_ref().and_then(|m| m.focused_pane()) {
@@ -953,6 +989,12 @@ impl ApplicationHandler<UserEvent> for App {
                     window.request_redraw();
                 }
             }
+            UserEvent::SessionsScanned => {
+                self.refresh_session_browser();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
             UserEvent::Redraw => {
                 if let Some(window) = &self.window {
                     if self.window_focused {
@@ -1081,17 +1123,21 @@ impl ApplicationHandler<UserEvent> for App {
                 tracing::info!("Mux initialized with 1 tab, 1 pane");
                 self.mux = Some(mux);
 
-                // Initialize session manager
+                // Initialize session manager. The initial scan parses every
+                // Claude Code transcript (~0.5 s for a few hundred MB), so it
+                // runs on the watcher thread rather than delaying the first frame.
                 let session_manager = Arc::new(nex_ai_session::SessionManager::new());
-                session_manager.scan();
-                tracing::info!("Scanned {} Claude Code sessions", session_manager.count());
                 self.session_manager = Some(Arc::clone(&session_manager));
 
-                // Start session file watcher in background
                 let watcher_manager = Arc::clone(&session_manager);
+                let scan_proxy = self.proxy.clone();
                 std::thread::Builder::new()
                     .name("session-watcher".into())
                     .spawn(move || {
+                        watcher_manager.scan();
+                        tracing::info!("Scanned {} Claude Code sessions", watcher_manager.count());
+                        // Refresh a session browser opened while scanning.
+                        let _ = scan_proxy.0.send_event(UserEvent::SessionsScanned);
                         if let Err(e) = watcher_manager.start_watcher() {
                             tracing::warn!("Session file watcher failed: {e}");
                         }
@@ -1375,23 +1421,8 @@ impl App {
         if super_key && shift && matches!(logical_key, Key::Character(c) if c.as_str() == "p" || c.as_str() == "P") {
             if self.session_browser.is_some() {
                 self.session_browser = None;
-            } else if let Some(mgr) = &self.session_manager {
-                let trees = mgr.session_trees();
-                let active_ids: Vec<String> = self.mux.as_ref()
-                    .map(|m| {
-                        trees.iter()
-                            .flat_map(|t| {
-                                let mut flat = Vec::new();
-                                for (i, root) in t.roots.iter().enumerate() {
-                                    root.flatten(0, i == t.roots.len() - 1, &mut flat);
-                                }
-                                flat.into_iter().filter(|f| m.is_session_active(&f.session.id)).map(|f| f.session.id)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let tool_names = mgr.provider_names();
-                self.session_browser = Some(SessionBrowser::new(trees, active_ids, tool_names));
+            } else {
+                self.session_browser = self.new_session_browser();
             }
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -2047,7 +2078,7 @@ impl App {
         if let Some(mux) = &mut self.mux {
             let area = Self::pane_area(self.renderer.as_ref().unwrap(), mux.tab_count() + 1);
             let initial_blocks = self.block_store.as_ref()
-                .map(|s| s.get_all_for_pane(&mux.focused_pane_id()).len())
+                .map(|s| s.sealed_count_for_pane(&mux.focused_pane_id()))
                 .unwrap_or(0);
             match mux.open_session(session_id, area, &self.proxy, &command, initial_blocks) {
                 Ok(was_existing) => {
@@ -2326,6 +2357,7 @@ impl App {
                 entries,
                 selected_index: browser.selected_index,
                 filter: filter_display,
+                loading: !self.session_manager.as_ref().is_some_and(|m| m.is_scanned()),
             }
         });
 

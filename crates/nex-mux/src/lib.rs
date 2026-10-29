@@ -230,7 +230,7 @@ impl Mux {
     pub fn cleanup_finished_sessions(&mut self, block_store: &nex_block::BlockStore) {
         let finished: Vec<String> = self.active_sessions.iter()
             .filter(|(_, active)| {
-                block_store.count_for_pane(&active.pane_id) > active.initial_block_count
+                block_store.sealed_count_for_pane(&active.pane_id) > active.initial_block_count
             })
             .map(|(id, _)| id.clone())
             .collect();

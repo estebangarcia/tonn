@@ -10,8 +10,11 @@ pub mod claude_code;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fmt;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -24,6 +27,11 @@ pub use claude_code::ClaudeCodeProvider;
 
 /// How recently a session file must have been modified to be considered "active."
 const ACTIVE_SESSION_RECENCY_SECS: u64 = 60;
+
+/// Changes to the same session file within this window are coalesced into one
+/// re-parse. Claude Code appends to its transcript many times a minute and a
+/// full parse of a large transcript costs tens of milliseconds.
+const WATCH_DEBOUNCE: Duration = Duration::from_secs(1);
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -201,6 +209,8 @@ fn build_tree(sessions: Vec<AiSession>) -> Vec<SessionNode> {
 pub struct SessionManager {
     providers: Vec<Box<dyn AiToolProvider>>,
     sessions: DashMap<String, AiSession>,
+    /// Set once the initial `scan` has finished (it runs in the background).
+    scanned: AtomicBool,
 }
 
 impl Default for SessionManager {
@@ -217,6 +227,7 @@ impl SessionManager {
         Self {
             providers,
             sessions: DashMap::new(),
+            scanned: AtomicBool::new(false),
         }
     }
 
@@ -234,6 +245,13 @@ impl SessionManager {
             }
         }
         debug!(count = self.sessions.len(), "session scan complete");
+        self.scanned.store(true, Ordering::Release);
+    }
+
+    /// Whether the initial scan has finished — until then the session list
+    /// is incomplete.
+    pub fn is_scanned(&self) -> bool {
+        self.scanned.load(Ordering::Acquire)
     }
 
     /// Return all sessions sorted by `updated_at` (most recent first).
@@ -330,9 +348,10 @@ impl SessionManager {
 
     /// Watch all registered providers' paths for file changes.
     ///
-    /// Blocks the calling thread. On `Create` or `Modify` events for matching
-    /// files, the affected session is re-parsed via the appropriate provider
-    /// and the map is updated.
+    /// Blocks the calling thread. The file-system callback only forwards
+    /// changed paths; this thread coalesces them for `WATCH_DEBOUNCE` and then
+    /// re-parses each changed path once via the providers (which ignore paths
+    /// that aren't their session files).
     pub fn start_watcher(self: &Arc<Self>) -> notify::Result<()> {
         let watch_paths: Vec<PathBuf> = self
             .providers
@@ -346,8 +365,7 @@ impl SessionManager {
             ));
         }
 
-        let manager = Arc::clone(self);
-
+        let (changed_tx, changed_rx) = mpsc::channel::<PathBuf>();
         let mut watcher =
             notify::recommended_watcher(move |result: Result<Event, notify::Error>| {
                 let event = match result {
@@ -357,23 +375,9 @@ impl SessionManager {
                         return;
                     }
                 };
-
-                let dominated = matches!(
-                    event.kind,
-                    EventKind::Create(_) | EventKind::Modify(_)
-                );
-
-                if !dominated {
-                    return;
-                }
-
-                for path in &event.paths {
-                    debug!(path = %path.display(), "session file changed, re-parsing");
-                    for provider in &manager.providers {
-                        if let Some(session) = provider.parse_file(path) {
-                            manager.sessions.insert(session.id.clone(), session);
-                            break;
-                        }
+                if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                    for path in event.paths {
+                        let _ = changed_tx.send(path);
                     }
                 }
             })?;
@@ -384,10 +388,34 @@ impl SessionManager {
             }
         }
 
-        // Park the thread — the watcher must stay alive.
-        std::thread::park();
-
+        // Runs until the watcher (and with it the sender) is dropped.
+        while let Ok(first) = changed_rx.recv() {
+            let mut changed = HashSet::from([first]);
+            let deadline = Instant::now() + WATCH_DEBOUNCE;
+            while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                match changed_rx.recv_timeout(remaining) {
+                    Ok(path) => {
+                        changed.insert(path);
+                    }
+                    Err(_) => break,
+                }
+            }
+            for path in &changed {
+                self.reparse(path);
+            }
+        }
         Ok(())
+    }
+
+    /// Re-parse one changed path with the first provider that recognises it.
+    fn reparse(&self, path: &Path) {
+        for provider in &self.providers {
+            if let Some(session) = provider.parse_file(path) {
+                debug!(path = %path.display(), "session file changed, re-parsed");
+                self.sessions.insert(session.id.clone(), session);
+                return;
+            }
+        }
     }
 }
 

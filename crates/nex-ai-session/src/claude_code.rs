@@ -29,6 +29,11 @@ const CLAUDE_CLI_FALLBACK: &str = "claude";
 /// Provider that discovers AI sessions from Claude Code's JSONL project files.
 pub struct ClaudeCodeProvider {
     base_dir: PathBuf,
+    /// `base_dir` plus, if different, its canonical path. The scan walks
+    /// `base_dir` as configured, but the macOS watcher canonicalizes its
+    /// roots and reports resolved paths — through a symlinked `~/.claude`
+    /// (or home) the two differ, and both must be recognised.
+    roots: Vec<PathBuf>,
 }
 
 impl ClaudeCodeProvider {
@@ -36,7 +41,29 @@ impl ClaudeCodeProvider {
         let base_dir = dirs::home_dir()
             .unwrap_or_default()
             .join(CLAUDE_PROJECTS_DIR);
-        Self { base_dir }
+        Self::with_base_dir(base_dir)
+    }
+
+    pub fn with_base_dir(base_dir: PathBuf) -> Self {
+        let mut roots = vec![base_dir.clone()];
+        if let Ok(canonical) = base_dir.canonicalize()
+            && canonical != base_dir
+        {
+            roots.push(canonical);
+        }
+        Self { base_dir, roots }
+    }
+
+    /// Whether `path` is a session transcript: `<base>/<project>/<id>.jsonl`.
+    /// Pure path check (no I/O). The projects tree also holds per-session
+    /// directories, `memory/` notes and nested subagent transcripts, which
+    /// must not be parsed as sessions.
+    fn is_session_file(&self, path: &Path) -> bool {
+        path.extension().and_then(|e| e.to_str()) == Some(JSONL_EXTENSION)
+            && path
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(|projects| self.roots.iter().any(|root| root == projects))
     }
 }
 
@@ -83,12 +110,7 @@ impl AiToolProvider for ClaudeCodeProvider {
             };
 
             for file_entry in files.flatten() {
-                let file_path = file_entry.path();
-                if file_path.extension().and_then(|e| e.to_str()) != Some(JSONL_EXTENSION) {
-                    continue;
-                }
-
-                if let Some(session) = self.parse_file(&file_path) {
+                if let Some(session) = self.parse_file(&file_entry.path()) {
                     sessions.push(session);
                 }
             }
@@ -102,6 +124,9 @@ impl AiToolProvider for ClaudeCodeProvider {
     }
 
     fn parse_file(&self, path: &Path) -> Option<AiSession> {
+        if !self.is_session_file(path) {
+            return None;
+        }
         parse_session_file(path)
     }
 
@@ -181,12 +206,10 @@ fn parse_session_file(path: &Path) -> Option<AiSession> {
     let mut last_timestamp: Option<DateTime<Utc>> = None;
     let mut message_count: usize = 0;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
+    // Stop at the first read error: `lines()` keeps yielding the same error
+    // forever (e.g. EISDIR when handed a directory), so skipping errors spins
+    // a core at 100% indefinitely.
+    for line in reader.lines().map_while(Result::ok) {
         if line.trim().is_empty() {
             continue;
         }
@@ -306,6 +329,56 @@ mod tests {
     use std::io::Write;
 
     const TEST_JSONL_EXTENSION: &str = JSONL_EXTENSION;
+
+    #[test]
+    fn only_project_level_transcripts_are_session_files() {
+        let base = PathBuf::from("/home/u/.claude/projects");
+        let provider = ClaudeCodeProvider::with_base_dir(base.clone());
+        let project = base.join("-home-u-repo");
+        assert!(provider.is_session_file(&project.join("abc.jsonl")));
+        // Per-session directories, nested subagent transcripts and memory notes.
+        assert!(!provider.is_session_file(&project.join("abc")));
+        assert!(!provider.is_session_file(&project.join("abc/subagents/agent-1.jsonl")));
+        assert!(!provider.is_session_file(&project.join("memory/notes.md")));
+        assert!(!provider.is_session_file(&base.join("stray.jsonl")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_files_are_recognised_through_a_symlinked_root() {
+        // The watcher reports resolved paths; the scan uses the configured
+        // (symlinked) root. Both spellings of a transcript must be accepted.
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real-projects");
+        std::fs::create_dir_all(&real_root).unwrap();
+        let linked_root = dir.path().join("linked-projects");
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+
+        let provider = ClaudeCodeProvider::with_base_dir(linked_root.clone());
+        assert!(provider.is_session_file(&linked_root.join("proj/abc.jsonl")));
+        let resolved_root = real_root.canonicalize().unwrap();
+        assert!(provider.is_session_file(&resolved_root.join("proj/abc.jsonl")));
+        assert!(!provider.is_session_file(&resolved_root.join("proj/abc/sub.jsonl")));
+    }
+
+    #[test]
+    fn unreadable_session_path_returns_promptly() {
+        // A directory named like a transcript: open() succeeds but every
+        // read() fails (EISDIR). Skipping read errors used to spin forever at
+        // 100% CPU on the file watcher thread.
+        let base = tempfile::tempdir().unwrap();
+        let dir_named_like_a_session = base.path().join("project").join("abc.jsonl");
+        std::fs::create_dir_all(&dir_named_like_a_session).unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(parse_session_file(&dir_named_like_a_session).is_none());
+        });
+        let returned_none = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("parse_session_file must not spin on read errors");
+        assert!(returned_none);
+    }
 
     /// Build a minimal JSONL fixture in a temp file.
     fn write_fixture(dir: &Path, session_id: &str, lines: &[&str]) -> PathBuf {
