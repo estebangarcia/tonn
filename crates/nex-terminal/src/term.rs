@@ -25,6 +25,8 @@ pub struct Term<L: EventListener> {
     /// main-screen cursor.
     saved_cursor_main: Cursor,
     saved_cursor_alt: Cursor,
+    /// `grid.rows_scrolled_off()` when the selection was last synced.
+    selection_scroll_mark: usize,
     event_listener: L,
 }
 
@@ -42,6 +44,7 @@ impl<L: EventListener> Term<L> {
             selection: None,
             saved_cursor_main: Cursor::default(),
             saved_cursor_alt: Cursor::default(),
+            selection_scroll_mark: 0,
             event_listener: listener,
         }
     }
@@ -98,7 +101,9 @@ impl<L: EventListener> Term<L> {
         let last_col = self.grid.columns().saturating_sub(1);
         let last_line = range.end.line.0;
         for line in range.start.line.0..=last_line {
-            let row = &self.grid[Line(line)];
+            // Selections are live-screen relative — read rows the same way,
+            // not through the scrolled viewport (`grid[line]`).
+            let row = self.grid.live_row(Line(line));
             let start_col = if line == range.start.line.0 { range.start.column.0 } else { 0 };
             let end_col = if line == last_line { range.end.column.0 } else { last_col };
             let mut buf = String::new();
@@ -190,6 +195,9 @@ impl<L: EventListener> Term<L> {
 
         std::mem::swap(&mut self.grid, &mut self.alt_grid);
         self.mode.set(TermMode::ALT_SCREEN, to_alt);
+        // A selection made on one screen means nothing on the other.
+        self.selection = None;
+        self.selection_scroll_mark = self.grid.rows_scrolled_off();
 
         if to_alt {
             // Entering alt: clear the alt buffer and park cursor at origin.
@@ -203,6 +211,26 @@ impl<L: EventListener> Term<L> {
             } else {
                 self.saved_cursor_main
             };
+        }
+    }
+
+    /// Keep the selection on its content after output scrolled rows off the
+    /// top of the screen (the viewport stays anchored while scrolled back, so
+    /// the highlight stays on the same text). Called after each parsed chunk.
+    /// A selection whose rows were evicted from history is dropped.
+    pub(crate) fn sync_selection_with_scroll(&mut self) {
+        let scrolled_off = self.grid.rows_scrolled_off();
+        let moved = scrolled_off.wrapping_sub(self.selection_scroll_mark);
+        self.selection_scroll_mark = scrolled_off;
+        if moved == 0 {
+            return;
+        }
+        let oldest_line = -(self.grid.history_size() as i32);
+        if let Some(sel) = &mut self.selection {
+            sel.rotate(-(moved.min(i32::MAX as usize) as i32));
+            if sel.start.point.line.0.max(sel.end.point.line.0) < oldest_line {
+                self.selection = None;
+            }
         }
     }
 

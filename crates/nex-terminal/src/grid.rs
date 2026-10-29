@@ -29,6 +29,13 @@ use crate::cell::Cell;
 use crate::cell::Flags;
 use crate::index::{Column, Line, Point};
 
+/// Extra history rows kept past `history_limit` while the user is scrolled
+/// back, so streaming output can't evict the lines being read — the view
+/// stays frozen. Bounds memory on a firehose (~16 B/cell: ≈160 MB at 200
+/// columns); past it the oldest rows go and the view starts moving again.
+/// Trimmed back to the limit once the view returns to the bottom.
+const MAX_HELD_HISTORY_ROWS: usize = 50_000;
+
 /// Implemented by anything that can report terminal dimensions.
 pub trait Dimensions {
     fn total_lines(&self) -> usize;
@@ -123,6 +130,9 @@ pub struct Grid {
     /// Top (inclusive) and bottom (exclusive) screen-relative line bounds for
     /// DECSTBM scroll region.
     scroll_region: Range<usize>,
+    /// Rows ever scrolled off the top of the screen (wrapping counter). Lets
+    /// `Term` keep a selection on its content as output streams.
+    rows_scrolled_off: usize,
 }
 
 impl Grid {
@@ -140,6 +150,7 @@ impl Grid {
             cursor: Cursor::default(),
             saved_cursor: Cursor::default(),
             scroll_region: 0..screen_lines,
+            rows_scrolled_off: 0,
         }
     }
 
@@ -167,6 +178,19 @@ impl Grid {
         self.rows.len() - self.screen_lines
     }
 
+    /// Rows ever scrolled off the top of the screen (wrapping). Compare two
+    /// readings with `wrapping_sub` to learn how far content moved up.
+    pub fn rows_scrolled_off(&self) -> usize {
+        self.rows_scrolled_off
+    }
+
+    /// Row at `line` counted from the top of the *live* screen, regardless of
+    /// `display_offset` (negative = scrollback). Selections live in this
+    /// space; `grid[line]` instead addresses the displayed viewport.
+    pub fn live_row(&self, line: Line) -> &Row {
+        &self.rows[self.index_from_top(line, 0)]
+    }
+
     // ---------------------------------------------------------------------
     // Indexing
     // ---------------------------------------------------------------------
@@ -176,7 +200,13 @@ impl Grid {
     /// `Line(0)` is the top of the *visible* screen (honouring display_offset).
     /// Negative values go into scrollback.
     fn line_to_index(&self, line: Line) -> usize {
-        let screen_top = self.rows.len() - self.screen_lines - self.display_offset;
+        self.index_from_top(line, self.display_offset)
+    }
+
+    /// Deque index of `line`, counted from a screen top `offset` rows back
+    /// into history. Clamped to the stored rows.
+    fn index_from_top(&self, line: Line, offset: usize) -> usize {
+        let screen_top = self.rows.len() - self.screen_lines - offset;
         let idx = screen_top as i32 + line.0;
         idx.clamp(0, self.rows.len() as i32 - 1) as usize
     }
@@ -204,6 +234,28 @@ impl Grid {
             Scroll::Bottom => 0,
         };
         self.display_offset = new_offset;
+        if self.display_offset == 0 {
+            // Back on the live screen: release any history held while frozen.
+            self.trim_history();
+        }
+    }
+
+    /// History rows to retain: `history_limit`, plus a held allowance while
+    /// scrolled back (see `MAX_HELD_HISTORY_ROWS`).
+    fn retained_history(&self) -> usize {
+        if self.display_offset > 0 {
+            self.history_limit + MAX_HELD_HISTORY_ROWS
+        } else {
+            self.history_limit
+        }
+    }
+
+    /// Drop the oldest rows beyond `retained_history()`.
+    fn trim_history(&mut self) {
+        while self.rows.len() > self.retained_history() + self.screen_lines {
+            self.rows.pop_front();
+        }
+        self.display_offset = self.display_offset.min(self.history_size());
     }
 
     // ---------------------------------------------------------------------
@@ -374,15 +426,12 @@ impl Grid {
         for _ in 0..n {
             self.rows.insert(insert_at, blank.clone());
         }
-        while self.rows.len() > self.history_limit + self.screen_lines {
-            self.rows.pop_front();
-        }
-
+        self.rows_scrolled_off = self.rows_scrolled_off.wrapping_add(n);
         // Keep a scrolled-back viewport anchored on the content it shows.
         if self.display_offset > 0 {
             self.display_offset += n;
         }
-        self.display_offset = self.display_offset.min(self.history_size());
+        self.trim_history();
     }
 
     /// Rotate the scroll region up by `n` rows in place: rows at
@@ -611,72 +660,56 @@ impl Grid {
             return;
         }
 
+        // Positions carried through the re-wrap as (deque row, column): the
+        // cursor, the saved cursor, and the first visible row — so a
+        // scrolled-back view stays on the same content after a resize.
+        const CURSOR: usize = 0;
+        const SAVED_CURSOR: usize = 1;
+        const VIEWPORT_TOP: usize = 2;
         let screen_top = self.rows.len().saturating_sub(self.screen_lines);
-        let cursor_deque_idx =
-            (screen_top as i32 + self.cursor.point.line.0).max(0) as usize;
-        let cursor_col = self.cursor.point.column.0;
-        let saved_deque_idx =
-            (screen_top as i32 + self.saved_cursor.point.line.0).max(0) as usize;
-        let saved_col = self.saved_cursor.point.column.0;
+        let deque_row = |point: Point| (screen_top as i32 + point.line.0).max(0) as usize;
+        let anchors = [
+            (deque_row(self.cursor.point), self.cursor.point.column.0),
+            (deque_row(self.saved_cursor.point), self.saved_cursor.point.column.0),
+            (screen_top.saturating_sub(self.display_offset), 0),
+        ];
 
-        // Phase 1: decompose into logical lines.
-        // Each entry: (cells, Option<cursor_offset>, Option<saved_cursor_offset>)
-        let mut logical_lines: Vec<(Vec<Cell>, Option<usize>, Option<usize>)> = Vec::new();
+        // Phase 1: decompose into logical lines, recording each anchor as
+        // (logical line index, cell offset within that line).
+        let mut logical_lines: Vec<Vec<Cell>> = Vec::new();
+        let mut anchor_offsets: [Option<(usize, usize)>; 3] = [None; 3];
         let mut cur_cells: Vec<Cell> = Vec::new();
-        let mut cur_cursor_off: Option<usize> = None;
-        let mut cur_saved_off: Option<usize> = None;
 
         for (deque_idx, row) in self.rows.iter().enumerate() {
             let real_len = row.occupied_len();
-
-            if deque_idx == cursor_deque_idx {
-                let clamped = if real_len == 0 { 0 } else { cursor_col.min(real_len - 1) };
-                cur_cursor_off = Some(cur_cells.len() + clamped);
-            }
-            if deque_idx == saved_deque_idx {
-                let clamped = if real_len == 0 { 0 } else { saved_col.min(real_len - 1) };
-                cur_saved_off = Some(cur_cells.len() + clamped);
+            for (&(anchor_row, anchor_col), slot) in anchors.iter().zip(&mut anchor_offsets) {
+                if anchor_row == deque_idx {
+                    let clamped = if real_len == 0 { 0 } else { anchor_col.min(real_len - 1) };
+                    *slot = Some((logical_lines.len(), cur_cells.len() + clamped));
+                }
             }
 
             cur_cells.extend_from_slice(&row.cells[..real_len]);
 
             if !row.wrapped {
-                logical_lines.push((
-                    std::mem::take(&mut cur_cells),
-                    cur_cursor_off.take(),
-                    cur_saved_off.take(),
-                ));
+                logical_lines.push(std::mem::take(&mut cur_cells));
             }
         }
         // Handle trailing wrapped row (shouldn't happen normally).
-        if !cur_cells.is_empty() || cur_cursor_off.is_some() || cur_saved_off.is_some() {
-            logical_lines.push((
-                std::mem::take(&mut cur_cells),
-                cur_cursor_off.take(),
-                cur_saved_off.take(),
-            ));
+        let anchored_on_trailing = anchor_offsets.iter().flatten().any(|&(line, _)| line == logical_lines.len());
+        if !cur_cells.is_empty() || anchored_on_trailing {
+            logical_lines.push(std::mem::take(&mut cur_cells));
         }
 
         // Phase 2: re-break each logical line at new_cols and rebuild.
         let mut new_rows: VecDeque<Row> = VecDeque::new();
-        let mut new_cursor_deque: Option<usize> = None;
-        let mut new_cursor_col: usize = 0;
-        let mut new_saved_deque: Option<usize> = None;
-        let mut new_saved_col: usize = 0;
+        let mut line_starts: Vec<usize> = Vec::with_capacity(logical_lines.len());
 
-        for (cells, c_off, s_off) in &logical_lines {
-            let base = new_rows.len();
+        for cells in &logical_lines {
+            line_starts.push(new_rows.len());
 
             if cells.is_empty() {
                 new_rows.push_back(Row::new(new_cols));
-                if let Some(off) = c_off {
-                    new_cursor_deque = Some(base);
-                    new_cursor_col = (*off).min(new_cols.saturating_sub(1));
-                }
-                if let Some(off) = s_off {
-                    new_saved_deque = Some(base);
-                    new_saved_col = (*off).min(new_cols.saturating_sub(1));
-                }
                 continue;
             }
 
@@ -687,27 +720,31 @@ impl Grid {
                 row.wrapped = i + 1 < num_chunks;
                 new_rows.push_back(row);
             }
-
-            if let Some(off) = c_off {
-                let off = (*off).min(cells.len().saturating_sub(1));
-                new_cursor_deque = Some(base + off / new_cols);
-                new_cursor_col = off % new_cols;
-            }
-            if let Some(off) = s_off {
-                let off = (*off).min(cells.len().saturating_sub(1));
-                new_saved_deque = Some(base + off / new_cols);
-                new_saved_col = off % new_cols;
-            }
         }
+
+        // Map each anchor to its (new deque row, new column).
+        let new_anchors = anchor_offsets.map(|anchor| {
+            anchor.map(|(line, off)| {
+                let base = line_starts[line];
+                let len = logical_lines[line].len();
+                if len == 0 {
+                    (base, off.min(new_cols.saturating_sub(1)))
+                } else {
+                    let off = off.min(len - 1);
+                    (base + off / new_cols, off % new_cols)
+                }
+            })
+        });
 
         // Ensure at least screen_lines rows exist.
         while new_rows.len() < self.screen_lines {
             new_rows.push_back(Row::new(new_cols));
         }
 
-        // Trim oldest scrollback if over history limit.
+        // Trim oldest scrollback if over the retained history.
+        let retained = self.retained_history();
         let mut trimmed: usize = 0;
-        while new_rows.len() > self.history_limit + self.screen_lines {
+        while new_rows.len() > retained + self.screen_lines {
             new_rows.pop_front();
             trimmed += 1;
         }
@@ -717,24 +754,27 @@ impl Grid {
         self.cols = new_cols;
 
         let new_screen_top = self.rows.len().saturating_sub(self.screen_lines);
+        let screen_line = |deque_idx: usize| {
+            let line = deque_idx.saturating_sub(trimmed) as i32 - new_screen_top as i32;
+            Line(line.clamp(0, self.screen_lines as i32 - 1))
+        };
 
         // Map cursor back to screen-relative coordinates.
-        if let Some(di) = new_cursor_deque {
-            let di = di.saturating_sub(trimmed);
-            let line = di as i32 - new_screen_top as i32;
-            self.cursor.point.line = Line(line.clamp(0, self.screen_lines as i32 - 1));
-            self.cursor.point.column = Column(new_cursor_col);
+        if let Some((di, col)) = new_anchors[CURSOR] {
+            self.cursor.point = Point::new(screen_line(di), Column(col));
         }
         self.cursor.input_needs_wrap = false;
 
-        if let Some(di) = new_saved_deque {
-            let di = di.saturating_sub(trimmed);
-            let line = di as i32 - new_screen_top as i32;
-            self.saved_cursor.point.line =
-                Line(line.clamp(0, self.screen_lines as i32 - 1));
-            self.saved_cursor.point.column = Column(new_saved_col);
+        if let Some((di, col)) = new_anchors[SAVED_CURSOR] {
+            self.saved_cursor.point = Point::new(screen_line(di), Column(col));
         }
 
+        // Keep a scrolled-back viewport's first row on the same content.
+        if self.display_offset > 0
+            && let Some((di, _)) = new_anchors[VIEWPORT_TOP]
+        {
+            self.display_offset = new_screen_top.saturating_sub(di.saturating_sub(trimmed));
+        }
         self.display_offset = self.display_offset.min(self.history_size());
     }
 
@@ -771,11 +811,15 @@ impl Grid {
             }
 
             // The remaining excess comes from the top → becomes scrollback.
-            // Adjust cursor so it stays on the same content.
+            // Adjust cursor so it stays on the same content, and keep a
+            // scrolled-back viewport anchored on what it was showing.
             self.cursor.point.line.0 -= pushed_to_scrollback as i32;
+            if self.display_offset > 0 {
+                self.display_offset += pushed_to_scrollback;
+            }
 
             // Trim oldest scrollback if over the history limit.
-            while self.rows.len() > self.history_limit + lines {
+            while self.rows.len() > self.retained_history() + lines {
                 self.rows.pop_front();
             }
         }
@@ -1202,6 +1246,109 @@ mod tests {
         g.reflow(10);
         let text: String = g[Line(0)].cells.iter().take(5).map(|c| c.c).collect();
         assert_eq!(text, "hello");
+    }
+
+    /// Feed `count` numbered single-line outputs ("0", "1", …) at the bottom.
+    fn stream_lines(g: &mut Grid, from: usize, count: usize) {
+        for i in from..from + count {
+            g.carriage_return();
+            for ch in i.to_string().chars() {
+                g.input(ch, true);
+            }
+            g.line_feed();
+        }
+    }
+
+    fn visible_text(g: &Grid) -> Vec<String> {
+        (0..g.screen_lines() as i32)
+            .map(|l| g[Line(l)].cells.iter().map(|c| c.c).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn scrolled_back_view_stays_frozen_past_history_limit() {
+        let limit = 10;
+        let mut g = Grid::new(6, 3, limit);
+        g.goto(Line(2), Column(0));
+        stream_lines(&mut g, 0, 20);
+        g.scroll_display(Scroll::Delta(5));
+        let frozen = visible_text(&g);
+
+        // Far more output than the history limit: the view must not move.
+        stream_lines(&mut g, 20, limit * 5);
+        assert_eq!(visible_text(&g), frozen);
+        assert!(g.history_size() > limit, "history held past the limit");
+
+        // Returning to the bottom releases the held history.
+        g.scroll_display(Scroll::Bottom);
+        assert_eq!(g.history_size(), limit);
+    }
+
+    #[test]
+    fn history_hold_is_bounded() {
+        let limit = 10;
+        let mut g = Grid::new(6, 3, limit);
+        g.goto(Line(2), Column(0));
+        stream_lines(&mut g, 0, 20);
+        g.scroll_display(Scroll::Delta(1));
+
+        stream_lines(&mut g, 20, MAX_HELD_HISTORY_ROWS + limit * 2);
+        assert_eq!(g.history_size(), limit + MAX_HELD_HISTORY_ROWS);
+    }
+
+    #[test]
+    fn history_at_bottom_respects_limit() {
+        let limit = 10;
+        let mut g = Grid::new(6, 3, limit);
+        g.goto(Line(2), Column(0));
+        stream_lines(&mut g, 0, limit * 5);
+        assert_eq!(g.history_size(), limit);
+    }
+
+    /// Grid of `cols` × `screen` whose history holds one 8-char line per
+    /// letter (`aaaaaaaa`, `bbbbbbbb`, …), with the cursor on the last row.
+    fn grid_with_letter_lines(cols: usize, screen: usize, letters: &str) -> Grid {
+        let mut g = Grid::new(cols, screen, 100);
+        g.goto(Line(screen as i32 - 1), Column(0));
+        for letter in letters.chars() {
+            g.carriage_return();
+            for _ in 0..8 {
+                g.input(letter, true);
+            }
+            g.line_feed();
+        }
+        g
+    }
+
+    #[test]
+    fn reflow_keeps_scrolled_back_view_on_same_content() {
+        // Narrowing re-wraps every line into two rows; without anchoring the
+        // same display_offset would point at different content.
+        let mut g = grid_with_letter_lines(10, 3, "abcdefgh");
+        g.scroll_display(Scroll::Delta(5));
+        let top = first_char(&g, 0);
+
+        g.reflow(4);
+        assert!(g.display_offset() > 0);
+        assert_eq!(first_char(&g, 0), top);
+        assert!(!g[Line(-1)].wrapped, "top row starts its logical line");
+    }
+
+    #[test]
+    fn reflow_at_bottom_stays_at_bottom() {
+        let mut g = grid_with_letter_lines(10, 3, "abcdefgh");
+        g.reflow(4);
+        assert_eq!(g.display_offset(), 0);
+    }
+
+    #[test]
+    fn shrinking_rows_keeps_scrolled_back_view_on_same_content() {
+        let mut g = grid_with_letter_lines(10, 6, "abcdefghij");
+        g.scroll_display(Scroll::Delta(2));
+        let top = first_char(&g, 0);
+
+        g.resize(10, 3);
+        assert_eq!(first_char(&g, 0), top);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use winit::window::{Window, WindowId};
 
 use nex_common::{PaneId, CELL_WIDTH_RATIO, LINE_HEIGHT_RATIO, PADDING};
 use nex_mux::{Mux, MuxEventProxy, Pane, Rect, SplitDirection, DEFAULT_TAB_TITLE};
-use nex_render::renderer::{BgCell, PaneContent, Renderer, RenderSpan, SelectionCell, SettingsFieldType, DEFAULT_FONT_SIZE, FONT_SIZE_STEP};
+use nex_render::renderer::{BgCell, PaneContent, Renderer, RenderSpan, ScrollPosition, SelectionCell, SettingsFieldType, DEFAULT_FONT_SIZE, FONT_SIZE_STEP};
 
 // UI constants
 const APP_TITLE: &str = "Tonn";
@@ -730,6 +730,19 @@ impl App {
         }
     }
 
+    /// Typing or pasting into the focused pane jumps back to the live screen.
+    /// Only input that reaches the PTY does this — Tonn shortcuts (split,
+    /// zoom, copy, tab switch…) and bare modifier presses leave a scrolled-back
+    /// view where it is.
+    fn scroll_focused_to_bottom(&self) {
+        let Some(pane) = self.mux.as_ref().and_then(|m| m.focused_pane()) else { return };
+        let mut term = pane.terminal.lock();
+        if term.grid().display_offset() > 0 {
+            term.grid_mut().scroll_display(nex_terminal::Scroll::Bottom);
+            pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Write bytes to the focused pane's PTY.
     fn write_to_focused(&self, data: &[u8]) -> bool {
         match self.mux.as_ref().and_then(|m| m.focused_pane()) {
@@ -1261,17 +1274,6 @@ impl App {
         text: Option<&str>,
         event_loop: &ActiveEventLoop,
     ) {
-        // Scroll to bottom on keypress
-        if let Some(mux) = &self.mux
-            && let Some(pane) = mux.focused_pane() {
-                let mut term = pane.terminal.lock();
-                if term.grid().display_offset() > 0 {
-                    term.grid_mut()
-                        .scroll_display(nex_terminal::Scroll::Bottom);
-                    pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-
         let ctrl = self.modifiers.state().control_key();
         let super_key = self.modifiers.state().super_key();
         let shift = self.modifiers.state().shift_key();
@@ -1454,7 +1456,9 @@ impl App {
             if let Ok(mut clipboard) = arboard::Clipboard::new()
                 && let Ok(text) = clipboard.get_text() {
                     let mode = self.focused_mode().unwrap_or_default();
-                    self.write_to_focused(&nex_terminal::paste::encode(&text, mode));
+                    if self.write_to_focused(&nex_terminal::paste::encode(&text, mode)) {
+                        self.scroll_focused_to_bottom();
+                    }
                 }
             return;
         }
@@ -1609,6 +1613,7 @@ impl App {
         };
 
         if wrote {
+            self.scroll_focused_to_bottom();
             // Clear selection after typing
             if let Some(mux) = &self.mux
                 && let Some(pane) = mux.focused_pane() {
@@ -1987,26 +1992,14 @@ impl App {
                 r: c.bg.r, g: c.bg.g, b: c.bg.b,
             }).collect();
 
-            let selection_cells = if let Some(sel) = &content.selection {
-                let display_offset = term.grid().display_offset();
-                let start_row = (sel.start.line.0 + display_offset as i32).max(0) as usize;
-                let end_row = (sel.end.line.0 + display_offset as i32).max(0) as usize;
-                let mut cells = Vec::new();
-                for row in start_row..=end_row {
-                    let col_start = if row == start_row { sel.start.column.0 } else { 0 };
-                    let col_end = if row == end_row {
-                        sel.end.column.0
-                    } else {
-                        term.grid().columns().saturating_sub(1)
-                    };
-                    for col in col_start..=col_end {
-                        cells.push(SelectionCell { row, col });
-                    }
-                }
-                cells
-            } else {
-                Vec::new()
-            };
+            let selection_cells = content.selection.iter()
+                .flat_map(|sel| sel.viewport_cells(
+                    term.grid().display_offset(),
+                    term.grid().screen_lines(),
+                    term.grid().columns(),
+                ))
+                .map(|(row, col)| SelectionCell { row, col })
+                .collect();
 
             PaneContent {
                 pane_id: pane.id,
@@ -2022,6 +2015,10 @@ impl App {
                 is_focused: pane.id == focused_id,
                 bell_active: bell_active && pane.id == focused_id,
                 needs_reshape: is_dirty,
+                scroll_position: ScrollPosition::scrolled_back(
+                    term.grid().display_offset(),
+                    term.grid().history_size(),
+                ),
             }
         }).collect();
 

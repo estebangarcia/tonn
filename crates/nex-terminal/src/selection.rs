@@ -56,6 +56,13 @@ impl Selection {
         self.end = Anchor { point, side };
     }
 
+    /// Shift both anchors by `lines` (negative = up), keeping the selection
+    /// on its content when that content scrolls.
+    pub fn rotate(&mut self, lines: i32) {
+        self.start.point.line.0 += lines;
+        self.end.point.line.0 += lines;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.start.point == self.end.point && self.start.side == self.end.side
     }
@@ -102,6 +109,30 @@ impl Selection {
     }
 }
 
+impl SelectionRange {
+    /// Cells of the range that are on screen, as viewport `(row, col)`.
+    /// The range is live-screen relative; `display_offset` maps it into the
+    /// viewport, and rows scrolled above or below it are skipped. The start
+    /// and end columns only apply on the range's real first and last rows.
+    pub fn viewport_cells(
+        &self,
+        display_offset: usize,
+        screen_lines: usize,
+        columns: usize,
+    ) -> impl Iterator<Item = (usize, usize)> + use<> {
+        let first = self.start.line.0 + display_offset as i32;
+        let last = self.end.line.0 + display_offset as i32;
+        let (start_col, end_col) = (self.start.column.0, self.end.column.0);
+        let last_col = columns.saturating_sub(1);
+
+        (first.max(0)..=last.min(screen_lines as i32 - 1)).flat_map(move |row| {
+            let from = if row == first { start_col } else { 0 };
+            let to = if row == last { end_col } else { last_col };
+            (from..=to.min(last_col)).map(move |col| (row as usize, col))
+        })
+    }
+}
+
 fn point_before(a: Point, b: Point) -> bool {
     if a.line.0 != b.line.0 {
         a.line.0 < b.line.0
@@ -135,6 +166,37 @@ mod tests {
             fn columns(&self) -> usize { 20 }
         }
         Term::new(Config { scrolling_history: 100 }, &Dim, NoopListener)
+    }
+
+    fn range(start: (i32, usize), end: (i32, usize)) -> SelectionRange {
+        SelectionRange {
+            start: Point::new(Line(start.0), Column(start.1)),
+            end: Point::new(Line(end.0), Column(end.1)),
+            is_block: false,
+        }
+    }
+
+    #[test]
+    fn viewport_cells_shift_by_display_offset() {
+        // Live line -2 with the view scrolled back 3 → viewport row 1.
+        let cells: Vec<_> = range((-2, 1), (-2, 3)).viewport_cells(3, 5, 10).collect();
+        assert_eq!(cells, [(1, 1), (1, 2), (1, 3)]);
+    }
+
+    #[test]
+    fn viewport_cells_skip_rows_outside_the_view() {
+        // Entirely above the view: nothing — not a stray highlight on row 0.
+        assert_eq!(range((-9, 0), (-8, 4)).viewport_cells(0, 5, 10).count(), 0);
+        // Entirely below the view (scrolled back past it): nothing.
+        assert_eq!(range((2, 0), (4, 4)).viewport_cells(5, 5, 10).count(), 0);
+    }
+
+    #[test]
+    fn viewport_cells_clip_a_partially_visible_range() {
+        // Starts above the view (col 7) and ends on viewport row 1, col 2: row 0
+        // is a middle row, so it highlights from column 0, not 7.
+        let cells: Vec<_> = range((-3, 7), (1, 2)).viewport_cells(0, 2, 4).collect();
+        assert_eq!(cells, [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2)]);
     }
 
     #[test]

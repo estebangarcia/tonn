@@ -48,6 +48,7 @@ impl<H> Processor<H> {
             charset_selected: false,
         };
         self.parser.advance(&mut handler, bytes);
+        term.sync_selection_with_scroll();
     }
 }
 
@@ -693,6 +694,61 @@ mod tests {
         let mut t = term(20, 3);
         feed(&mut t, b"\x1b[?2004h");
         assert!(t.mode().contains(TermMode::BRACKETED_PASTE));
+    }
+
+    /// Select the whole of viewport row `row` the way the UI does
+    /// (`pixel_to_grid`: live line = viewport row − display offset).
+    fn select_viewport_row(t: &mut Term<NoopListener>, row: i32) {
+        let line = Line(row - t.grid().display_offset() as i32);
+        let last = Column(t.grid().columns() - 1);
+        let mut sel = crate::selection::Selection::new(
+            crate::selection::SelectionType::Simple,
+            crate::index::Point::new(line, Column(0)),
+            crate::index::Side::Left,
+        );
+        sel.update(crate::index::Point::new(line, last), crate::index::Side::Right);
+        t.selection = Some(sel);
+    }
+
+    fn viewport_text(t: &Term<NoopListener>, row: i32) -> String {
+        t.grid()[Line(row)].cells.iter().map(|c| c.c).collect::<String>().trim_end().to_string()
+    }
+
+    fn feed_numbered_lines(t: &mut Term<NoopListener>, lines: std::ops::Range<usize>) {
+        for i in lines {
+            feed(t, format!("line {i}\r\n").as_bytes());
+        }
+    }
+
+    #[test]
+    fn copy_while_scrolled_back_returns_the_highlighted_text() {
+        let mut t = term(20, 5);
+        feed_numbered_lines(&mut t, 0..20);
+        t.grid_mut().scroll_display(crate::grid::Scroll::Delta(3));
+        select_viewport_row(&mut t, 1);
+        assert_eq!(t.selection_to_string().unwrap(), viewport_text(&t, 1));
+    }
+
+    #[test]
+    fn selection_stays_on_its_text_while_output_streams() {
+        let mut t = term(20, 5);
+        feed_numbered_lines(&mut t, 0..20);
+        t.grid_mut().scroll_display(crate::grid::Scroll::Delta(3));
+        select_viewport_row(&mut t, 1);
+        let selected = t.selection_to_string().unwrap();
+
+        feed_numbered_lines(&mut t, 20..25);
+        assert_eq!(viewport_text(&t, 1), selected, "view frozen");
+        assert_eq!(t.selection_to_string().unwrap(), selected, "selection followed its text");
+    }
+
+    #[test]
+    fn switching_screens_clears_the_selection() {
+        let mut t = term(20, 5);
+        feed(&mut t, b"hello");
+        select_viewport_row(&mut t, 0);
+        feed(&mut t, b"\x1b[?1049h");
+        assert!(t.selection.is_none());
     }
 
     #[test]

@@ -106,6 +106,54 @@ pub struct SelectionCell {
     pub col: usize,
 }
 
+/// How far a pane is scrolled back into its history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollPosition {
+    /// Lines scrolled back from the bottom.
+    pub offset: usize,
+    /// Total lines of scrollback history.
+    pub history: usize,
+}
+
+impl ScrollPosition {
+    /// `Some` only while scrolled back — at the bottom there is no badge.
+    pub fn scrolled_back(offset: usize, history: usize) -> Option<Self> {
+        (offset > 0).then_some(Self { offset, history })
+    }
+
+    /// Badge text, Alacritty-style: `[offset/history]`.
+    pub fn label(&self) -> String {
+        format!("[{}/{}]", self.offset, self.history)
+    }
+}
+
+/// The scroll-position badge over a pane's top-right cells.
+struct ScrollBadge {
+    label: String,
+    x: f32,
+    y: f32,
+    width: f32,
+}
+
+impl ScrollBadge {
+    /// Place the badge on the pane's first row, right-aligned to the last
+    /// cell column, or `None` if the pane isn't scrolled back or is too narrow.
+    fn for_pane(pane: &PaneContent, cell_width: f32) -> Option<Self> {
+        let label = pane.scroll_position?.label();
+        let columns = ((pane.width - PADDING * 2.0) / cell_width).floor().max(0.0) as usize;
+        let label_cols = label.chars().count();
+        if label_cols > columns {
+            return None;
+        }
+        Some(Self {
+            x: pane.x + PADDING + (columns - label_cols) as f32 * cell_width,
+            y: pane.y + PADDING,
+            width: label_cols as f32 * cell_width,
+            label,
+        })
+    }
+}
+
 /// Content for one pane, ready to render.
 pub struct PaneContent {
     pub pane_id: PaneId,
@@ -122,6 +170,8 @@ pub struct PaneContent {
     pub bell_active: bool,
     /// If false, skip text reshaping — reuse the previous frame's buffer.
     pub needs_reshape: bool,
+    /// Set while scrolled back; draws a `[offset/history]` badge.
+    pub scroll_position: Option<ScrollPosition>,
 }
 
 /// An overlay panel (e.g., tab switcher).
@@ -244,6 +294,8 @@ pub struct Renderer {
     measured_cell_width: Option<f32>,
     // Per-pane text buffers (reused across frames)
     pane_buffers: HashMap<PaneId, Buffer>,
+    /// Per-pane scroll-position badge text.
+    scroll_badge_buffers: HashMap<PaneId, Buffer>,
     cursor_buffer: Buffer,
     tab_buffers: Vec<Buffer>,
     overlay_buffer: Buffer,
@@ -396,6 +448,7 @@ impl Renderer {
             font_family,
             measured_cell_width: None,
             pane_buffers: HashMap::new(),
+            scroll_badge_buffers: HashMap::new(),
             cursor_buffer,
             tab_buffers: Vec::new(),
             overlay_buffer,
@@ -583,6 +636,7 @@ impl Renderer {
     /// Remove buffers for panes that no longer exist.
     pub fn cleanup_pane_buffers(&mut self, active_pane_ids: &[PaneId]) {
         self.pane_buffers.retain(|id, _| active_pane_ids.contains(id));
+        self.scroll_badge_buffers.retain(|id, _| active_pane_ids.contains(id));
     }
 
     /// Render a complete frame with tab bar, multiple panes, dividers, and optional overlays.
@@ -613,6 +667,10 @@ impl Renderer {
         let lh = self.line_height();
         let sw = self.surface_config.width as i32;
         let sh = self.surface_config.height as i32;
+
+        let scroll_badges: HashMap<PaneId, ScrollBadge> = panes.iter()
+            .filter_map(|pane| Some((pane.pane_id, ScrollBadge::for_pane(pane, cw)?)))
+            .collect();
 
         // --- Build all rect vertices (bg cells + selection + dividers + focus borders) ---
         let mut all_rect_vertices: Vec<RectVertex> = Vec::new();
@@ -645,6 +703,15 @@ impl Renderer {
                     let x0 = ox + PADDING + cell.col as f32 * cw;
                     let y0 = oy + PADDING + cell.row as f32 * lh;
                     all_rect_vertices.extend_from_slice(&self.build_rect_vertices(x0, y0, cw, lh, sel_color));
+                }
+
+                // Scroll-position badge background (inverted theme colours),
+                // after the cell backgrounds so it sits on top of them.
+                if let Some(badge) = scroll_badges.get(&pane.pane_id) {
+                    let badge_bg = Self::color3(self.theme.fg);
+                    all_rect_vertices.extend_from_slice(
+                        &self.build_rect_vertices(badge.x, badge.y, badge.width, lh, badge_bg),
+                    );
                 }
 
                 // Focus border (colored border around focused pane)
@@ -755,6 +822,22 @@ impl Renderer {
                 );
                 self.cursor_buffer.shape_until_scroll(&mut self.font_system, false);
             }
+
+            if let Some(badge) = scroll_badges.get(&pane.pane_id) {
+                let badge_buf = self.scroll_badge_buffers.entry(pane.pane_id).or_insert_with(|| {
+                    Buffer::new(&mut self.font_system, metrics)
+                });
+                badge_buf.set_metrics(&mut self.font_system, metrics);
+                badge_buf.set_size(&mut self.font_system, Some(badge.width), Some(lh));
+                badge_buf.set_text(
+                    &mut self.font_system,
+                    &badge.label,
+                    &default_attrs.clone().color(glyphon_rgb(self.theme.bg)),
+                    Shaping::Advanced,
+                    None,
+                );
+                badge_buf.shape_until_scroll(&mut self.font_system, false);
+            }
         }
 
         // --- Phase 2: Build TextAreas from populated buffers ---
@@ -764,18 +847,56 @@ impl Renderer {
         if !has_overlay {
             for pane in panes.iter() {
                 if let Some(buf) = self.pane_buffers.get(&pane.pane_id) {
-                    text_areas.push(TextArea {
+                    let pane_text = |bounds| TextArea {
                         buffer: buf,
                         left: pane.x + PADDING,
                         top: pane.y + PADDING,
                         scale: 1.0,
-                        bounds: TextBounds {
-                            left: (pane.x as i32).max(0),
-                            top: (pane.y as i32).max(0),
-                            right: ((pane.x + pane.width) as i32).min(sw),
-                            bottom: ((pane.y + pane.height) as i32).min(sh),
-                        },
+                        bounds,
                         default_color: glyphon_rgb(self.theme.fg),
+                        custom_glyphs: &[],
+                    };
+                    let full = TextBounds {
+                        left: (pane.x as i32).max(0),
+                        top: (pane.y as i32).max(0),
+                        right: ((pane.x + pane.width) as i32).min(sw),
+                        bottom: ((pane.y + pane.height) as i32).min(sh),
+                    };
+
+                    match scroll_badges.get(&pane.pane_id) {
+                        None => text_areas.push(pane_text(full)),
+                        Some(badge) => {
+                            // Draw the pane text around the badge so glyphs
+                            // under it don't overlap the label: everything
+                            // below the badge row, then the badge row up to
+                            // the badge's left edge.
+                            let badge_bottom = (badge.y + lh) as i32;
+                            text_areas.push(pane_text(TextBounds { top: badge_bottom, ..full }));
+                            text_areas.push(pane_text(TextBounds {
+                                right: (badge.x as i32).min(full.right),
+                                bottom: badge_bottom,
+                                ..full
+                            }));
+                        }
+                    }
+                }
+
+                if let (Some(badge), Some(badge_buf)) = (
+                    scroll_badges.get(&pane.pane_id),
+                    self.scroll_badge_buffers.get(&pane.pane_id),
+                ) {
+                    text_areas.push(TextArea {
+                        buffer: badge_buf,
+                        left: badge.x,
+                        top: badge.y,
+                        scale: 1.0,
+                        bounds: TextBounds {
+                            left: (badge.x as i32).max(0),
+                            top: (badge.y as i32).max(0),
+                            right: ((badge.x + badge.width) as i32).min(sw),
+                            bottom: ((badge.y + lh) as i32).min(sh),
+                        },
+                        default_color: glyphon_rgb(self.theme.bg),
                         custom_glyphs: &[],
                     });
                 }
@@ -1565,5 +1686,59 @@ impl Renderer {
         self.text_atlas.trim();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CELL_W: f32 = 10.0;
+
+    fn pane(width: f32, scroll_position: Option<ScrollPosition>) -> PaneContent {
+        PaneContent {
+            pane_id: PaneId::new(),
+            x: 100.0,
+            y: 50.0,
+            width,
+            height: 400.0,
+            spans: Vec::new(),
+            bg_cells: Vec::new(),
+            selection_cells: Vec::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            is_focused: true,
+            bell_active: false,
+            needs_reshape: false,
+            scroll_position,
+        }
+    }
+
+    #[test]
+    fn no_badge_at_the_bottom() {
+        assert_eq!(ScrollPosition::scrolled_back(0, 500), None);
+        assert!(ScrollBadge::for_pane(&pane(400.0, None), CELL_W).is_none());
+    }
+
+    #[test]
+    fn label_shows_offset_and_history() {
+        let position = ScrollPosition::scrolled_back(120, 5000).unwrap();
+        assert_eq!(position.label(), "[120/5000]");
+    }
+
+    #[test]
+    fn badge_is_right_aligned_on_the_first_row() {
+        // (400 - 2 × PADDING) / 10 = 38 columns; "[3/10]" is 6 wide → col 32.
+        let badge = ScrollBadge::for_pane(&pane(400.0, ScrollPosition::scrolled_back(3, 10)), CELL_W).unwrap();
+        assert_eq!(badge.x, 100.0 + PADDING + 32.0 * CELL_W);
+        assert_eq!(badge.y, 50.0 + PADDING);
+        assert_eq!(badge.width, 6.0 * CELL_W);
+    }
+
+    #[test]
+    fn no_badge_when_the_pane_is_too_narrow() {
+        // 4 columns can't fit "[3/10]".
+        let narrow = pane(PADDING * 2.0 + 4.0 * CELL_W, ScrollPosition::scrolled_back(3, 10));
+        assert!(ScrollBadge::for_pane(&narrow, CELL_W).is_none());
     }
 }

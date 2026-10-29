@@ -1,7 +1,7 @@
 //! Built-in terminal multiplexer for Tonn.
 //!
 //! Manages tabs, panes (splits), and their associated PTY + terminal instances.
-//! Each pane owns a PTY process and a VT emulator (alacritty_terminal::Term).
+//! Each pane owns a PTY process and a VT emulator.
 
 mod layout;
 mod pane;
