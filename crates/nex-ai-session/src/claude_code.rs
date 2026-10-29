@@ -1,11 +1,11 @@
 //! Claude Code provider — discovers and parses Claude Code session JSONL files.
 
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use tracing::debug;
+use serde_json::Value;
 
 use crate::{project_name_from_path, AiSession, AiTool, AiToolProvider};
 
@@ -16,6 +16,22 @@ const SUMMARY_ELLIPSIS: &str = "…";
 const JSONL_EXTENSION: &str = "jsonl";
 const CLAUDE_PROJECTS_DIR: &str = ".claude/projects";
 const PATH_SEPARATOR: char = '-';
+
+/// How much of a transcript's start and end is read for its metadata (title,
+/// cwd, model, timestamps) — the window the VS Code extension uses too.
+/// Transcripts reach tens of MB; parsing every line as JSON took ~40 ms for a
+/// 28 MB file and ~0.5 s for a full scan.
+const TRANSCRIPT_WINDOW_BYTES: u64 = 64 * 1024;
+/// A renamed session's title, stored next to the transcript:
+/// `<project>/<session-id>/custom-title.json` → `{"customTitle": "…"}`.
+const CUSTOM_TITLE_SIDECAR: &str = "custom-title.json";
+/// Lines counted as messages (top-level `type`; JSON-string content escapes
+/// its quotes, so these only match real entries).
+const MESSAGE_MARKERS: [&str; 2] = [r#""type":"user""#, r#""type":"assistant""#];
+const INTERRUPTED_MARKER: &str = "[Request interrupted by user";
+const COMMAND_NAME_TAGS: (&str, &str) = ("<command-name>", "</command-name>");
+const BASH_INPUT_TAGS: (&str, &str) = ("<bash-input>", "</bash-input>");
+const BASH_INPUT_PREFIX: &str = "! ";
 
 const CLAUDE_CLI_LOCAL_BIN: &str = ".local/bin/claude";
 const CLAUDE_CLI_DOT_CLAUDE_BIN: &str = ".claude/bin/claude";
@@ -130,6 +146,23 @@ impl AiToolProvider for ClaudeCodeProvider {
         parse_session_file(path)
     }
 
+    /// A transcript maps to itself; a title sidecar
+    /// (`<project>/<id>/custom-title.json`) to its transcript
+    /// (`<project>/<id>.jsonl`), so renames refresh the title.
+    fn session_file_for(&self, changed: &Path) -> Option<PathBuf> {
+        if self.is_session_file(changed) {
+            return Some(changed.to_path_buf());
+        }
+        if changed.file_name()?.to_str()? != CUSTOM_TITLE_SIDECAR {
+            return None;
+        }
+        let session_dir = changed.parent()?;
+        let transcript = session_dir
+            .parent()?
+            .join(format!("{}.{JSONL_EXTENSION}", session_dir.file_name()?.to_str()?));
+        self.is_session_file(&transcript).then_some(transcript)
+    }
+
     fn resume_command(&self, session: &AiSession) -> String {
         let claude = find_claude_cli();
         format!(
@@ -143,39 +176,18 @@ impl AiToolProvider for ClaudeCodeProvider {
 
 // ── JSONL Parsing ────────────────────────────────────────────────────────────
 
-/// Extract text content from a `message.content` value.
-///
-/// Handles both forms:
-/// - String: `"content": "hello"`
-/// - Array:  `"content": [{"type": "text", "text": "hello"}, ...]`
-fn extract_text_content(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Array(items) => {
-            for item in items {
-                if item.get("type").and_then(|t| t.as_str()) == Some("text")
-                    && let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        return Some(text.to_string());
-                    }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-/// Truncate a string to `SUMMARY_MAX_CHARS`, appending ellipsis if truncated.
+/// One line for the session list: control characters (newlines, tabs) become
+/// spaces, and the text is cut to `SUMMARY_MAX_CHARS` characters with an
+/// ellipsis.
 fn truncate_summary(text: &str) -> String {
-    let trimmed = text.trim().replace('\n', " ");
-    if trimmed.len() <= SUMMARY_MAX_CHARS {
-        trimmed
-    } else {
-        let boundary = trimmed
-            .char_indices()
-            .nth(SUMMARY_MAX_CHARS)
-            .map(|(i, _)| i)
-            .unwrap_or(trimmed.len());
-        format!("{}{SUMMARY_ELLIPSIS}", &trimmed[..boundary])
+    let flattened: String = text
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    match flattened.char_indices().nth(SUMMARY_MAX_CHARS) {
+        Some((boundary, _)) => format!("{}{SUMMARY_ELLIPSIS}", flattened[..boundary].trim_end()),
+        None => flattened,
     }
 }
 
@@ -191,103 +203,67 @@ fn decode_project_path(encoded: &str) -> PathBuf {
 
 /// Parse a single Claude Code session JSONL file.
 ///
-/// Streams line-by-line with `BufReader` to handle large files efficiently.
+/// Only the first and last `TRANSCRIPT_WINDOW_BYTES` are parsed as JSON (the
+/// title, cwd, model and timestamps live there); the message count comes
+/// from a plain text scan of the whole file.
 fn parse_session_file(path: &Path) -> Option<AiSession> {
-    let file = File::open(path).ok()?;
-    let reader = BufReader::new(file);
-
     let session_id = path.file_stem()?.to_str()?.to_string();
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
 
-    let mut summary: Option<String> = None;
-    let mut model: Option<String> = None;
-    let mut cwd: Option<String> = None;
-    let mut parent_id: Option<String> = None;
-    let mut first_timestamp: Option<DateTime<Utc>> = None;
-    let mut last_timestamp: Option<DateTime<Utc>> = None;
-    let mut message_count: usize = 0;
+    let head = parse_lines(&read_head(&mut file, len)?);
+    let tail_entries = match read_tail(&mut file, len)? {
+        Some(window) => parse_lines(&window),
+        None => Vec::new(),
+    };
+    // A small transcript fits in the head window: then it's also the tail.
+    let tail: &[Value] = if len > TRANSCRIPT_WINDOW_BYTES { &tail_entries } else { &head };
 
-    // Stop at the first read error: `lines()` keeps yielding the same error
-    // forever (e.g. EISDIR when handed a directory), so skipping errors spins
-    // a core at 100% indefinitely.
-    for line in reader.lines().map_while(Result::ok) {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let entry: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => {
-                debug!(path = %path.display(), "skipping malformed JSONL line");
-                continue;
-            }
-        };
-
-        let msg_type = entry.get("type").and_then(|t| t.as_str());
-
-        // Track timestamps from every line that has one
-        if let Some(ts_str) = entry.get("timestamp").and_then(|t| t.as_str())
-            && let Ok(ts) = ts_str.parse::<DateTime<Utc>>() {
-                if first_timestamp.is_none() {
-                    first_timestamp = Some(ts);
-                }
-                last_timestamp = Some(ts);
-            }
-
-        // Extract parent session ID from forkedFrom or parentSessionId
-        if parent_id.is_none() {
-            if let Some(forked) = entry.get("forkedFrom")
-                && let Some(pid) = forked.get("sessionId").and_then(|v| v.as_str()) {
-                    parent_id = Some(pid.to_string());
-                }
-            if parent_id.is_none()
-                && let Some(pid) = entry.get("parentSessionId").and_then(|v| v.as_str()) {
-                    parent_id = Some(pid.to_string());
-                }
-        }
-
-        // Extract cwd from the first message that has it
-        if cwd.is_none()
-            && let Some(c) = entry.get("cwd").and_then(|v| v.as_str()) {
-                cwd = Some(c.to_string());
-            }
-
-        match msg_type {
-            Some("user") => {
-                message_count += 1;
-                if summary.is_none()
-                    && let Some(content) = entry.get("message").and_then(|m| m.get("content"))
-                        && let Some(text) = extract_text_content(content) {
-                            summary = Some(truncate_summary(&text));
-                        }
-            }
-            Some("assistant") => {
-                message_count += 1;
-                if model.is_none()
-                    && let Some(m) = entry
-                        .get("message")
-                        .and_then(|msg| msg.get("model"))
-                        .and_then(|v| v.as_str())
-                    {
-                        model = Some(m.to_string());
-                    }
-            }
-            _ => {}
-        }
+    // A subagent ("sidechain") transcript isn't a session of its own.
+    if head.first().and_then(|e| e.get("isSidechain")).and_then(Value::as_bool) == Some(true) {
+        return None;
     }
 
-    let created_at = first_timestamp?;
-    let updated_at = last_timestamp.unwrap_or(created_at);
+    // Fallbacks for timestamps outside the windows (e.g. a transcript that
+    // opens with large untimestamped records): scan forward for the first
+    // one; for the last, use the file's modification time.
+    let created_at = head
+        .iter()
+        .find_map(timestamp)
+        .or_else(|| first_timestamp_in_file(&mut file))?;
+    let updated_at = tail
+        .iter()
+        .rev()
+        .find_map(timestamp)
+        .or_else(|| file.metadata().and_then(|m| m.modified()).ok().map(DateTime::<Utc>::from))
+        .unwrap_or(created_at)
+        .max(created_at);
+    let cwd = head.iter().find_map(|e| str_field(e, "cwd"));
+    let parent_id = head.iter().find_map(|e| {
+        e.get("forkedFrom")
+            .and_then(|f| f.get("sessionId"))
+            .and_then(Value::as_str)
+            .or_else(|| str_field(e, "parentSessionId"))
+            .map(str::to_string)
+    });
+    let model = [head.as_slice(), tail]
+        .into_iter()
+        .find_map(|entries| entries.iter().find_map(assistant_model));
 
-    let project_dir = if let Some(ref c) = cwd {
-        PathBuf::from(c)
-    } else {
-        path.parent()
+    let custom_title_file = path.parent()?.join(&session_id).join(CUSTOM_TITLE_SIDECAR);
+    let summary = session_title(&head, tail, read_custom_title(&custom_title_file))
+        .map(|title| truncate_summary(&title))
+        .unwrap_or_default();
+
+    let project_dir = match cwd {
+        Some(c) => PathBuf::from(c),
+        None => path
+            .parent()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .map(decode_project_path)
-            .unwrap_or_default()
+            .unwrap_or_default(),
     };
-
     let project_name = project_name_from_path(&project_dir);
 
     Some(AiSession {
@@ -296,13 +272,222 @@ fn parse_session_file(path: &Path) -> Option<AiSession> {
         file_path: path.to_path_buf(),
         project_dir,
         project_name,
-        summary: summary.unwrap_or_default(),
-        message_count,
+        summary,
+        message_count: count_messages(&mut file),
         created_at,
         updated_at,
-        model,
+        model: model.map(str::to_string),
         tool: AiTool::ClaudeCode,
     })
+}
+
+/// The session's list title, in the VS Code extension's order of preference:
+/// a custom title (from `/rename`), the AI-generated title (`ai-title`, newest
+/// first), the last prompt, a legacy summary, then the first real prompt.
+fn session_title(head: &[Value], tail: &[Value], sidecar_title: Option<String>) -> Option<String> {
+    let latest = |entries: &[Value], entry_type: &str, key: &str| {
+        entries
+            .iter()
+            .rev()
+            .filter(|e| str_field(e, "type") == Some(entry_type))
+            .find_map(|e| str_field(e, key).filter(|v| !v.trim().is_empty()))
+            .map(str::to_string)
+    };
+    latest(tail, "custom-title", "customTitle")
+        .or(sidecar_title)
+        .or_else(|| latest(head, "custom-title", "customTitle"))
+        .or_else(|| latest(tail, "ai-title", "aiTitle"))
+        .or_else(|| latest(head, "ai-title", "aiTitle"))
+        .or_else(|| latest(tail, "last-prompt", "lastPrompt"))
+        .or_else(|| latest(tail, "summary", "summary"))
+        .or_else(|| first_prompt(head))
+}
+
+/// The first prompt the user actually typed. Skips meta and compaction
+/// entries, tool results, and text that starts with injected context —
+/// `<ide_opened_file>`, `<ide_selection>`, `<system-reminder>`, … — or an
+/// interruption notice. Shell inputs read `! cmd`; if only slash commands
+/// were sent, the first command's name is used.
+fn first_prompt(entries: &[Value]) -> Option<String> {
+    let mut command_fallback = None;
+    for entry in entries {
+        let is_flag = |key| entry.get(key).and_then(Value::as_bool) == Some(true);
+        if str_field(entry, "type") != Some("user") || is_flag("isMeta") || is_flag("isCompactSummary") {
+            continue;
+        }
+        let texts: Vec<&str> = match entry.get("message").and_then(|m| m.get("content")) {
+            Some(Value::String(text)) => vec![text],
+            Some(Value::Array(blocks)) => {
+                if blocks.iter().any(|b| str_field(b, "type") == Some("tool_result")) {
+                    continue;
+                }
+                blocks
+                    .iter()
+                    .filter(|b| str_field(b, "type") == Some("text"))
+                    .filter_map(|b| str_field(b, "text"))
+                    .collect()
+            }
+            _ => continue,
+        };
+        for text in texts {
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if let Some(command) = between(text, COMMAND_NAME_TAGS) {
+                command_fallback.get_or_insert_with(|| command.to_string());
+                continue;
+            }
+            if let Some(input) = between(text, BASH_INPUT_TAGS) {
+                return Some(format!("{BASH_INPUT_PREFIX}{}", input.trim()));
+            }
+            if !is_injected_context(text) {
+                return Some(text.to_string());
+            }
+        }
+    }
+    command_fallback
+}
+
+/// Whether text starts with a tag (`<ide_opened_file>`, `<system-reminder …>`)
+/// or an interruption notice — context added around a prompt, not the prompt.
+fn is_injected_context(text: &str) -> bool {
+    if text.starts_with(INTERRUPTED_MARKER) {
+        return true;
+    }
+    let Some(rest) = text.strip_prefix('<') else { return false };
+    let mut chars = rest.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    chars
+        .find(|&c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .is_some_and(|c| c.is_whitespace() || c == '>')
+}
+
+/// The text between the first `open` tag and the following `close` tag.
+fn between<'a>(text: &'a str, (open, close): (&str, &str)) -> Option<&'a str> {
+    let start = text.find(open)? + open.len();
+    let len = text[start..].find(close)?;
+    Some(&text[start..start + len])
+}
+
+fn str_field<'a>(entry: &'a Value, key: &str) -> Option<&'a str> {
+    entry.get(key).and_then(Value::as_str)
+}
+
+fn timestamp(entry: &Value) -> Option<DateTime<Utc>> {
+    str_field(entry, "timestamp")?.parse().ok()
+}
+
+fn assistant_model(entry: &Value) -> Option<&str> {
+    if str_field(entry, "type") != Some("assistant") {
+        return None;
+    }
+    entry.get("message").and_then(|m| str_field(m, "model"))
+}
+
+/// A renamed session's title from its sidecar file, control characters removed.
+fn read_custom_title(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&contents).ok()?;
+    let title: String = str_field(&value, "customTitle")?.chars().filter(|c| !c.is_control()).collect();
+    let title = title.trim();
+    (!title.is_empty()).then(|| title.to_string())
+}
+
+/// The transcript's first `TRANSCRIPT_WINDOW_BYTES`, extended to the end of
+/// the record the window cuts into — so even an opening record larger than
+/// the window (e.g. a pasted log as the first prompt) is read whole.
+fn read_head(file: &mut File, len: u64) -> Option<Vec<u8>> {
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut head = Vec::with_capacity(len.min(TRANSCRIPT_WINDOW_BYTES) as usize);
+    (&mut reader).take(TRANSCRIPT_WINDOW_BYTES).read_to_end(&mut head).ok()?;
+    if head.last().is_some_and(|&b| b != b'\n') {
+        reader.read_until(b'\n', &mut head).ok()?;
+    }
+    Some(head)
+}
+
+/// The transcript's last `TRANSCRIPT_WINDOW_BYTES`, extended back to the start
+/// of the record the window cuts into — so a final record larger than the
+/// window is read whole. `None` when the head already covers the file.
+fn read_tail(file: &mut File, len: u64) -> Option<Option<Vec<u8>>> {
+    if len <= TRANSCRIPT_WINDOW_BYTES {
+        return Some(None);
+    }
+    let start = record_start_at_or_before(file, len - TRANSCRIPT_WINDOW_BYTES)?;
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::with_capacity((len - start) as usize);
+    file.take(len - start).read_to_end(&mut tail).ok()?;
+    Some(Some(tail))
+}
+
+/// Offset of the start of the record containing byte `pos`: just after the
+/// nearest preceding newline, or 0. Searches backwards a window at a time.
+fn record_start_at_or_before(file: &mut File, pos: u64) -> Option<u64> {
+    let mut end = pos;
+    let mut chunk = Vec::new();
+    while end > 0 {
+        let start = end.saturating_sub(TRANSCRIPT_WINDOW_BYTES);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        chunk.clear();
+        (&mut *file).take(end - start).read_to_end(&mut chunk).ok()?;
+        if let Some(newline) = chunk.iter().rposition(|&b| b == b'\n') {
+            return Some(start + newline as u64 + 1);
+        }
+        end = start;
+    }
+    Some(0)
+}
+
+/// Parse a window's JSONL records (windows start and end on record
+/// boundaries); blank and unparseable lines — e.g. a record still being
+/// written — are skipped.
+fn parse_lines(window: &[u8]) -> Vec<Value> {
+    window
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .filter_map(|line| serde_json::from_slice(line).ok())
+        .collect()
+}
+
+/// The first record timestamp anywhere in the file (fallback when the head
+/// window has none).
+fn first_timestamp_in_file(file: &mut File) -> Option<DateTime<Utc>> {
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line).ok()? > 0 {
+        if let Ok(entry) = serde_json::from_slice::<Value>(&line)
+            && let Some(found) = timestamp(&entry)
+        {
+            return Some(found);
+        }
+        line.clear();
+    }
+    None
+}
+
+/// Count user/assistant entries over the whole file with a plain text scan —
+/// no JSON parsing.
+fn count_messages(file: &mut File) -> usize {
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return 0;
+    }
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut count = 0;
+    while reader.read_until(b'\n', &mut line).is_ok_and(|read| read > 0) {
+        if let Ok(text) = std::str::from_utf8(&line)
+            && MESSAGE_MARKERS.iter().any(|marker| text.contains(marker))
+        {
+            count += 1;
+        }
+        line.clear();
+    }
+    count
 }
 
 // ── CLI Discovery ───────────────────────────────────────────────────────────
@@ -390,33 +575,190 @@ mod tests {
         path
     }
 
-    // ── extract_text_content ─────────────────────────────────────────────
+    // ── first_prompt / session_title ─────────────────────────────────────
 
-    #[test]
-    fn text_content_from_string() {
-        let val = serde_json::json!("hello world");
-        assert_eq!(extract_text_content(&val).unwrap(), "hello world");
+    fn user(content: serde_json::Value) -> Value {
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": content}})
     }
 
     #[test]
-    fn text_content_from_array() {
-        let val = serde_json::json!([
+    fn first_prompt_from_string_or_text_blocks() {
+        assert_eq!(first_prompt(&[user(serde_json::json!("hello world"))]).as_deref(), Some("hello world"));
+        let blocks = serde_json::json!([
             {"type": "tool_use", "id": "abc"},
             {"type": "text", "text": "Build a server"}
         ]);
-        assert_eq!(extract_text_content(&val).unwrap(), "Build a server");
+        assert_eq!(first_prompt(&[user(blocks)]).as_deref(), Some("Build a server"));
+        assert_eq!(first_prompt(&[user(serde_json::json!([]))]), None);
+        assert_eq!(first_prompt(&[user(Value::Null)]), None);
     }
 
     #[test]
-    fn text_content_from_empty_array() {
-        let val = serde_json::json!([]);
-        assert!(extract_text_content(&val).is_none());
+    fn first_prompt_skips_injected_context() {
+        // What a VS Code session's first message looks like.
+        let blocks = serde_json::json!([
+            {"type": "text", "text": "<ide_opened_file>The user opened the file /a/b.rs</ide_opened_file>"},
+            {"type": "text", "text": "<system-reminder>be nice</system-reminder>"},
+            {"type": "text", "text": "Fix the scroll bug"}
+        ]);
+        let mut meta = user(serde_json::json!("Caveat: generated by a command"));
+        meta["isMeta"] = Value::Bool(true);
+        let tool_result = user(serde_json::json!([{"type": "tool_result", "content": "x"}]));
+        let interrupted = user(serde_json::json!("[Request interrupted by user]"));
+        let entries = [meta, tool_result, interrupted, user(blocks)];
+        assert_eq!(first_prompt(&entries).as_deref(), Some("Fix the scroll bug"));
     }
 
     #[test]
-    fn text_content_from_null() {
-        let val = serde_json::Value::Null;
-        assert!(extract_text_content(&val).is_none());
+    fn first_prompt_shell_input_and_command_fallback() {
+        let bash = user(serde_json::json!("<bash-input> git status </bash-input>"));
+        assert_eq!(first_prompt(&[bash]).as_deref(), Some("! git status"));
+        let command = user(serde_json::json!("<command-name>/init</command-name><command-message>init</command-message>"));
+        assert_eq!(first_prompt(&[command]).as_deref(), Some("/init"));
+    }
+
+    #[test]
+    fn injected_context_detection() {
+        assert!(is_injected_context("<ide_selection>The user selected"));
+        assert!(is_injected_context("<system-reminder>\nx"));
+        assert!(is_injected_context("[Request interrupted by user for tool use]"));
+        assert!(!is_injected_context("<3 this terminal"), "not a tag");
+        assert!(!is_injected_context("Use <Box> here"), "tag not at the start");
+    }
+
+    #[test]
+    fn title_preference_order() {
+        let ai = |t: &str| serde_json::json!({"type": "ai-title", "aiTitle": t});
+        let custom = serde_json::json!({"type": "custom-title", "customTitle": "My rename"});
+        let last = serde_json::json!({"type": "last-prompt", "lastPrompt": "latest ask"});
+        let prompt = user(serde_json::json!("first ask"));
+
+        let head = [prompt.clone(), ai("Old title")];
+        let tail = [ai("New title"), last.clone()];
+        assert_eq!(session_title(&head, &tail, None).as_deref(), Some("New title"), "newest AI title");
+        assert_eq!(session_title(&head, &[custom], None).as_deref(), Some("My rename"));
+        assert_eq!(session_title(&head, &tail, Some("Sidecar".into())).as_deref(), Some("Sidecar"));
+        assert_eq!(session_title(std::slice::from_ref(&prompt), &[last], None).as_deref(), Some("latest ask"));
+        assert_eq!(session_title(&[prompt], &[], None).as_deref(), Some("first ask"));
+    }
+
+    #[test]
+    fn large_transcript_reads_title_and_end_time_from_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = vec![
+            r#"{"type":"user","message":{"role":"user","content":"<ide_opened_file>x</ide_opened_file>"},"timestamp":"2026-01-15T10:00:00Z","cwd":"/Users/me/proj"}"#.to_string(),
+        ];
+        // ~150 KB of assistant turns: bigger than the head + tail windows.
+        let filler = "z".repeat(100);
+        for _ in 0..1_000 {
+            lines.push(format!(
+                r#"{{"type":"assistant","message":{{"model":"claude-x","content":[{{"type":"text","text":"{filler}"}}]}},"timestamp":"2026-01-15T10:30:00Z"}}"#
+            ));
+        }
+        lines.push(r#"{"type":"ai-title","aiTitle":"Fix the scroll bug"}"#.to_string());
+        lines.push(r#"{"type":"user","message":{"role":"user","content":"thanks"},"timestamp":"2026-01-15T11:00:00Z"}"#.to_string());
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let path = write_fixture(dir.path(), "big", &refs);
+        assert!(fs::metadata(&path).unwrap().len() > 2 * TRANSCRIPT_WINDOW_BYTES);
+
+        let session = parse_session_file(&path).unwrap();
+        assert_eq!(session.summary, "Fix the scroll bug");
+        assert_eq!(session.message_count, 1_002, "counted over the whole file");
+        assert_eq!(session.updated_at, "2026-01-15T11:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(session.model.as_deref(), Some("claude-x"));
+        assert_eq!(session.project_dir, PathBuf::from("/Users/me/proj"));
+    }
+
+    /// A record whose message text is bigger than a metadata window.
+    fn oversized_record(entry_type: &str, timestamp: &str) -> String {
+        let text = "x".repeat(70_000);
+        format!(r#"{{"type":"{entry_type}","message":{{"role":"{entry_type}","content":"{text}"}},"timestamp":"{timestamp}"}}"#)
+    }
+
+    #[test]
+    fn opening_record_larger_than_the_window_is_read_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = oversized_record("user", "2026-01-15T10:00:00Z");
+        let path = write_fixture(dir.path(), "big-first", &[&first, r#"{"type":"ai-title","aiTitle":"Pasted log triage"}"#]);
+        let session = parse_session_file(&path).expect("session must not be hidden");
+        assert_eq!(session.created_at, "2026-01-15T10:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(session.summary, "Pasted log triage");
+    }
+
+    #[test]
+    fn final_record_larger_than_the_window_sets_the_update_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lines = vec![
+            r#"{"type":"user","message":{"role":"user","content":"start"},"timestamp":"2026-01-15T10:00:00Z"}"#.to_string(),
+        ];
+        lines.push(oversized_record("assistant", "2026-01-15T12:00:00Z"));
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let session = parse_session_file(&write_fixture(dir.path(), "big-last", &refs)).unwrap();
+        assert_eq!(session.updated_at, "2026-01-15T12:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    #[test]
+    fn creation_time_found_beyond_the_head_window() {
+        // The head window holds only untimestamped records.
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = format!(r#"{{"type":"file-history-snapshot","snapshot":"{}"}}"#, "s".repeat(70_000));
+        let path = write_fixture(
+            dir.path(),
+            "late-ts",
+            &[
+                r#"{"type":"ai-title","aiTitle":"Late timestamps"}"#,
+                &snapshot,
+                r#"{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"2026-01-15T10:00:00Z"}"#,
+            ],
+        );
+        let session = parse_session_file(&path).expect("session must not be hidden");
+        assert_eq!(session.created_at, "2026-01-15T10:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    #[test]
+    fn changed_paths_map_to_their_transcript() {
+        let base = PathBuf::from("/home/u/.claude/projects");
+        let provider = ClaudeCodeProvider::with_base_dir(base.clone());
+        let project = base.join("-home-u-repo");
+        let transcript = project.join("abc.jsonl");
+        assert_eq!(provider.session_file_for(&transcript), Some(transcript.clone()));
+        assert_eq!(provider.session_file_for(&project.join("abc").join(CUSTOM_TITLE_SIDECAR)), Some(transcript));
+        assert_eq!(provider.session_file_for(&project.join("memory/notes.md")), None);
+        assert_eq!(provider.session_file_for(&project.join("abc/subagents/agent-1.jsonl")), None);
+    }
+
+    #[test]
+    fn renamed_session_uses_its_custom_title_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(
+            dir.path(),
+            "renamed",
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"2026-01-15T10:00:00Z"}"#,
+                r#"{"type":"ai-title","aiTitle":"Generated title"}"#,
+            ],
+        );
+        let sidecar_dir = dir.path().join("renamed");
+        fs::create_dir_all(&sidecar_dir).unwrap();
+        fs::write(sidecar_dir.join(CUSTOM_TITLE_SIDECAR), r#"{"customTitle":"Release prep\n"}"#).unwrap();
+        assert_eq!(parse_session_file(&path).unwrap().summary, "Release prep");
+    }
+
+    #[test]
+    fn sidechain_transcript_is_not_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture(
+            dir.path(),
+            "agent",
+            &[r#"{"isSidechain":true,"type":"user","message":{"role":"user","content":"sub task"},"timestamp":"2026-01-15T10:00:00Z"}"#],
+        );
+        assert!(parse_session_file(&path).is_none());
+    }
+
+    #[test]
+    fn multibyte_title_under_the_limit_is_not_marked_truncated() {
+        let title = "日本語のタイトル".repeat(5); // 40 chars, 120 bytes
+        assert_eq!(truncate_summary(&title), title);
     }
 
     // ── truncate_summary ─────────────────────────────────────────────────

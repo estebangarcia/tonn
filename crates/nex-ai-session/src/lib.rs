@@ -141,6 +141,13 @@ pub trait AiToolProvider: Send + Sync {
     /// Parse a single file into a session, if applicable.
     fn parse_file(&self, path: &Path) -> Option<AiSession>;
 
+    /// The session file a changed path affects — the file itself by
+    /// default; providers whose sessions also depend on other files (e.g. a
+    /// title sidecar) map those to their session file. `None` if unrelated.
+    fn session_file_for(&self, changed: &Path) -> Option<PathBuf> {
+        Some(changed.to_path_buf())
+    }
+
     /// Build a shell command to resume the given session.
     fn resume_command(&self, session: &AiSession) -> String;
 }
@@ -222,8 +229,11 @@ impl Default for SessionManager {
 impl SessionManager {
     /// Create a new `SessionManager` with the `ClaudeCodeProvider` registered.
     pub fn new() -> Self {
-        let providers: Vec<Box<dyn AiToolProvider>> =
-            vec![Box::new(ClaudeCodeProvider::new())];
+        Self::with_providers(vec![Box::new(ClaudeCodeProvider::new())])
+    }
+
+    /// Create a `SessionManager` over the given providers.
+    pub fn with_providers(providers: Vec<Box<dyn AiToolProvider>>) -> Self {
         Self {
             providers,
             sessions: DashMap::new(),
@@ -375,7 +385,9 @@ impl SessionManager {
                         return;
                     }
                 };
-                if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                // Removals too: a deleted title sidecar changes the title,
+                // a deleted transcript drops its session.
+                if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)) {
                     for path in event.paths {
                         let _ = changed_tx.send(path);
                     }
@@ -408,11 +420,21 @@ impl SessionManager {
     }
 
     /// Re-parse one changed path with the first provider that recognises it.
-    fn reparse(&self, path: &Path) {
+    /// Re-parse the session a changed path belongs to, with the first
+    /// provider that recognises it; drop the session if its file is gone.
+    fn reparse(&self, changed: &Path) {
         for provider in &self.providers {
-            if let Some(session) = provider.parse_file(path) {
-                debug!(path = %path.display(), "session file changed, re-parsed");
+            let Some(session_file) = provider.session_file_for(changed) else { continue };
+            if let Some(session) = provider.parse_file(&session_file) {
+                debug!(path = %session_file.display(), "session file changed, re-parsed");
                 self.sessions.insert(session.id.clone(), session);
+                return;
+            }
+            if !session_file.exists()
+                && let Some(id) = session_file.file_stem().and_then(|stem| stem.to_str())
+                && self.sessions.remove(id).is_some()
+            {
+                debug!(path = %session_file.display(), "session file removed");
                 return;
             }
         }
@@ -424,6 +446,47 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watcher_reparse_follows_renames_and_removals() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("-home-u-repo");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join("abc.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"2026-01-15T10:00:00Z"}"#, "\n",
+                r#"{"type":"ai-title","aiTitle":"Generated title"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let provider = ClaudeCodeProvider::with_base_dir(root.path().to_path_buf());
+        let manager = SessionManager::with_providers(vec![Box::new(provider)]);
+        manager.scan();
+        let title = |m: &SessionManager| m.get("abc").map(|s| s.summary);
+        assert_eq!(title(&manager).as_deref(), Some("Generated title"));
+
+        // Renaming writes only the sidecar; the watcher reports that path.
+        let sidecar_dir = project.join("abc");
+        std::fs::create_dir_all(&sidecar_dir).unwrap();
+        let sidecar = sidecar_dir.join("custom-title.json");
+        std::fs::write(&sidecar, r#"{"customTitle":"Renamed"}"#).unwrap();
+        manager.reparse(&sidecar);
+        assert_eq!(title(&manager).as_deref(), Some("Renamed"));
+
+        std::fs::write(&sidecar, r#"{"customTitle":"Renamed again"}"#).unwrap();
+        manager.reparse(&sidecar);
+        assert_eq!(title(&manager).as_deref(), Some("Renamed again"));
+
+        std::fs::remove_file(&sidecar).unwrap();
+        manager.reparse(&sidecar);
+        assert_eq!(title(&manager).as_deref(), Some("Generated title"));
+
+        std::fs::remove_file(&transcript).unwrap();
+        manager.reparse(&transcript);
+        assert_eq!(title(&manager), None, "deleted transcript drops its session");
+    }
 
     fn make_session(id: &str, project: &str, summary: &str, updated: &str) -> AiSession {
         make_session_with_parent(id, project, summary, updated, None)
