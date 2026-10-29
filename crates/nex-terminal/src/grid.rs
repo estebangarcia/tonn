@@ -369,9 +369,11 @@ impl Grid {
     /// Move cursor down one row, scrolling the region if at the bottom.
     pub fn line_feed(&mut self) {
         let bottom = self.scroll_region.end as i32 - 1;
-        if self.cursor.point.line.0 == bottom {
+        let line = self.cursor.point.line.0;
+        if line == bottom {
             self.scroll_up_region(1);
-        } else {
+        } else if line < self.screen_lines as i32 - 1 {
+            // Below the scroll region the cursor still stops at the last row.
             self.cursor.point.line.0 += 1;
         }
         self.cursor.input_needs_wrap = false;
@@ -381,9 +383,11 @@ impl Grid {
     /// if already at the top.
     pub fn reverse_index(&mut self) {
         let top = self.scroll_region.start as i32;
-        if self.cursor.point.line.0 == top {
+        let line = self.cursor.point.line.0;
+        if line == top {
             self.scroll_down_region(1);
-        } else {
+        } else if line > 0 {
+            // Above the scroll region the cursor still stops at the first row.
             self.cursor.point.line.0 -= 1;
         }
         self.cursor.input_needs_wrap = false;
@@ -644,7 +648,23 @@ impl Grid {
     }
 
     pub fn restore_cursor(&mut self) {
-        self.cursor = self.saved_cursor;
+        self.set_cursor(self.saved_cursor);
+    }
+
+    /// Install a previously saved cursor (DECRC, leaving the alt screen),
+    /// clamped to the current screen: the grid may have been resized since it
+    /// was saved, and an off-screen cursor panics on the next cell write.
+    pub fn set_cursor(&mut self, cursor: Cursor) {
+        self.cursor = cursor;
+        self.cursor.point = self.clamp_to_screen(cursor.point);
+    }
+
+    /// Clamp a point onto the visible screen.
+    fn clamp_to_screen(&self, point: Point) -> Point {
+        Point::new(
+            Line(point.line.0.clamp(0, self.screen_lines as i32 - 1)),
+            Column(point.column.0.min(self.cols - 1)),
+        )
     }
 
     // ---------------------------------------------------------------------
@@ -826,16 +846,7 @@ impl Grid {
         self.screen_lines = lines;
 
         // Clamp cursor to the visible screen.
-        if self.cursor.point.line.0 < 0 {
-            self.cursor.point.line.0 = 0;
-        }
-        let max_line = (lines - 1) as i32;
-        if self.cursor.point.line.0 > max_line {
-            self.cursor.point.line.0 = max_line;
-        }
-        if self.cursor.point.column.0 >= cols {
-            self.cursor.point.column.0 = cols - 1;
-        }
+        self.cursor.point = self.clamp_to_screen(self.cursor.point);
         self.cursor.input_needs_wrap = false;
 
         // Reset scroll region.

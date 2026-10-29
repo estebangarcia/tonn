@@ -199,10 +199,12 @@ fn io_thread<Proxy: MuxEventProxy>(
                     });
                 }
 
-                // Feed all bytes to VT parser
-                {
-                    let mut term = terminal.lock();
-                    processor.advance(&mut *term, data);
+                // Feed all bytes to VT parser. A panic here would kill this
+                // thread and freeze the pane for good, so it's contained (the
+                // parser is reset and the terminal repaired); log it — the
+                // panic hook has already printed the message — and carry on.
+                if !processor.advance_contained(&mut *terminal.lock(), data) {
+                    tracing::error!(%pane_id, "VT emulator panicked; dropped an output chunk and reset the parser");
                 }
                 dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 event_proxy.send_redraw();

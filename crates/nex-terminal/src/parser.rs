@@ -50,6 +50,27 @@ impl<H> Processor<H> {
         self.parser.advance(&mut handler, bytes);
         term.sync_selection_with_scroll();
     }
+
+    /// Like `advance`, but a panic while processing is contained instead of
+    /// unwinding into the caller. vte only returns to its ground state
+    /// *after* a dispatch callback returns, so a callback that unwinds leaves
+    /// the parser mid-sequence and later output would be misparsed (text
+    /// eaten as escape-sequence bytes). On a panic the parser is therefore
+    /// replaced with a fresh one and the terminal's invariants are restored.
+    /// Returns `false` if a panic was contained.
+    ///
+    /// Used by the pane I/O thread, where an escaped panic would kill the
+    /// thread and freeze the pane.
+    pub fn advance_contained<L: EventListener>(&mut self, term: &mut Term<L>, bytes: &[u8]) -> bool {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.advance(term, bytes);
+        }));
+        if outcome.is_err() {
+            *self = Self::new();
+            term.restore_invariants();
+        }
+        outcome.is_ok()
+    }
 }
 
 /// The transient bridge between vte's `Perform` callbacks and our `Term`.
@@ -749,6 +770,170 @@ mod tests {
         select_viewport_row(&mut t, 0);
         feed(&mut t, b"\x1b[?1049h");
         assert!(t.selection.is_none());
+    }
+
+    fn resize(t: &mut Term<NoopListener>, cols: usize, rows: usize) {
+        t.resize(crate::TermSize::new(cols, rows));
+    }
+
+    fn assert_cursor_on_screen(t: &Term<NoopListener>) {
+        let point = t.grid().cursor.point;
+        assert!((0..t.grid().screen_lines() as i32).contains(&point.line.0), "cursor line {point:?}");
+        assert!(point.column.0 < t.grid().columns(), "cursor column {point:?}");
+    }
+
+    #[test]
+    fn leaving_alt_screen_after_a_shrink_restores_an_on_screen_cursor() {
+        // `git diff` with less: enter the alt screen with the cursor far
+        // right/down, the pane shrinks (resize, split, tab bar appears),
+        // quit → the saved main-screen cursor must be clamped, or the next
+        // write panics and the pane's I/O thread dies (frozen pane).
+        let mut t = term(40, 10);
+        feed(&mut t, b"\x1b[9;36H\x1b[?1049h");
+        resize(&mut t, 10, 4);
+        feed(&mut t, b"\x1b[?1049l");
+        assert_cursor_on_screen(&t);
+        feed(&mut t, b"x\x1b[5@\x1b[5P\x1b[1K");
+    }
+
+    #[test]
+    fn restoring_a_saved_cursor_after_a_shrink_clamps_it() {
+        let mut t = term(40, 10);
+        feed(&mut t, b"\x1b[9;36H\x1b7");
+        resize(&mut t, 10, 4);
+        feed(&mut t, b"\x1b8");
+        assert_cursor_on_screen(&t);
+        feed(&mut t, b"\x1b[5P\x1b[1J");
+    }
+
+    #[test]
+    fn reverse_index_above_the_scroll_region_stops_at_the_top() {
+        let mut t = term(10, 10);
+        feed(&mut t, b"\x1b[5;8r\x1b[1;1H\x1bM");
+        assert_eq!(t.grid().cursor.point.line, Line(0));
+        feed(&mut t, b"\x1b[1J");
+    }
+
+    #[test]
+    fn line_feed_below_the_scroll_region_stops_at_the_bottom() {
+        let mut t = term(10, 10);
+        feed(&mut t, b"\x1b[2;4r\x1b[10;1H\n\n");
+        assert_eq!(t.grid().cursor.point.line, Line(9));
+        feed(&mut t, b"x\x1b[0J");
+    }
+
+    /// Deterministic fuzz: random escape sequences interleaved with resizes,
+    /// scrolling and selection reads must never panic — a panic in the
+    /// pane's I/O thread freezes that pane.
+    #[test]
+    fn random_sequences_and_resizes_never_panic() {
+        const SEQUENCES: u64 = 2_000;
+        const OPS_PER_SEQUENCE: usize = 60;
+        const SEED_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+
+        fn random_bytes(r: &mut Rng) -> String {
+            let params = [0, 1, 2, 4096, 65535, r.below(300) + 1, r.below(300) + 1];
+            let n = params[r.below(params.len() as u64) as usize];
+            let m = params[r.below(params.len() as u64) as usize];
+            let fixed = [
+                "text", "日本語🙂", "\r\n", "\n", "\x08", "\t", "\x1b7", "\x1b8", "\x1b[s", "\x1b[u",
+                "\x1bM", "\x1bD", "\x1bE", "\x1bc", "\x1b[!p", "\x1b[r", "\x1b[?7l", "\x1b[?7h",
+                "\x1b[4h", "\x1b[4l", "\x1b[?1049h", "\x1b[?1049l", "\x1b[?47h", "\x1b[?47l",
+                "\x1b[?1047h", "\x1b[?1048h", "\x1b[?1048l",
+            ];
+            if r.below(2) == 0 {
+                return fixed[r.below(fixed.len() as u64) as usize].to_string();
+            }
+            let finals = ['H', 'f', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'd', 'J', 'K', '@', 'P', 'X', 'L', 'M', 'S', 'T', 'Z', 'r'];
+            let f = finals[r.below(finals.len() as u64) as usize];
+            format!("\x1b[{n};{m}{f}")
+        }
+
+        for seed in 1..=SEQUENCES {
+            let mut r = Rng(seed.wrapping_mul(SEED_MIX));
+            let mut t = term(40, 10);
+            let mut p = Processor::<StdSyncHandler>::new();
+            let mut ops = Vec::new();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                for _ in 0..OPS_PER_SEQUENCE {
+                    match r.below(10) {
+                        0 => {
+                            let (cols, rows) = (r.below(120) as usize + 1, r.below(50) as usize + 1);
+                            ops.push(format!("resize {cols}x{rows}"));
+                            resize(&mut t, cols, rows);
+                        }
+                        1 => {
+                            let delta = r.below(40) as i32 - 20;
+                            ops.push(format!("scroll {delta}"));
+                            t.grid_mut().scroll_display(crate::grid::Scroll::Delta(delta));
+                            select_viewport_row(&mut t, r.below(10) as i32);
+                            let _ = t.selection_to_string();
+                        }
+                        _ => {
+                            let bytes = random_bytes(&mut r);
+                            ops.push(format!("{bytes:?}"));
+                            p.advance(&mut t, bytes.as_bytes());
+                        }
+                    }
+                }
+            }));
+            assert!(outcome.is_ok(), "seed {seed} panicked after: {ops:?}");
+        }
+    }
+
+    /// Panics when the terminal replies to a query, so a DSR unwinds out of
+    /// `csi_dispatch` while vte is still mid-sequence.
+    struct PanicOnReply;
+    impl EventListener for PanicOnReply {
+        fn send_event(&self, event: Event) {
+            if matches!(event, Event::PtyWrite(_)) {
+                panic!("injected panic");
+            }
+        }
+    }
+
+    fn panicking_term() -> Term<PanicOnReply> {
+        Term::new(Config { scrolling_history: 10 }, &crate::TermSize::new(20, 3), PanicOnReply)
+    }
+
+    const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
+
+    #[test]
+    fn contained_panic_resets_the_parser_for_later_output() {
+        let mut t = panicking_term();
+        let mut p = Processor::<StdSyncHandler>::new();
+        assert!(!p.advance_contained(&mut t, CURSOR_POSITION_QUERY), "panic contained");
+
+        // Plain text straight after the panic (no ESC to resynchronise vte):
+        // a stale mid-CSI parser would eat the `h` as a final byte.
+        assert!(p.advance_contained(&mut t, b"hello"));
+        let row: String = t.grid()[Line(0)].cells.iter().take(5).map(|c| c.c).collect();
+        assert_eq!(row, "hello");
+    }
+
+    #[test]
+    fn contained_panic_puts_the_cursor_back_on_screen() {
+        let mut t = panicking_term();
+        let mut p = Processor::<StdSyncHandler>::new();
+        // Leave the cursor off screen, as a half-done operation could.
+        t.grid_mut().cursor.point = crate::index::Point::new(Line(50), Column(99));
+
+        assert!(!p.advance_contained(&mut t, CURSOR_POSITION_QUERY));
+        let point = t.grid().cursor.point;
+        assert!(point.line.0 < 3 && point.column.0 < 20, "cursor on screen: {point:?}");
     }
 
     #[test]

@@ -206,11 +206,12 @@ impl<L: EventListener> Term<L> {
         }
 
         if save_cursor {
-            self.grid.cursor = if to_alt {
+            // Saved before a possible resize — `set_cursor` clamps it.
+            self.grid.set_cursor(if to_alt {
                 self.saved_cursor_alt
             } else {
                 self.saved_cursor_main
-            };
+            });
         }
     }
 
@@ -232,6 +233,15 @@ impl<L: EventListener> Term<L> {
                 self.selection = None;
             }
         }
+    }
+
+    /// Re-establish invariants after a contained panic may have left an
+    /// operation half-done — chiefly that the cursor is on screen, since
+    /// every cell write indexes with it.
+    pub(crate) fn restore_invariants(&mut self) {
+        let cursor = self.grid.cursor;
+        self.grid.set_cursor(cursor);
+        self.grid.cursor.input_needs_wrap = false;
     }
 
     pub(crate) fn reset_all(&mut self) {
@@ -341,3 +351,4 @@ mod tests {
         assert!(t.grid().cursor.point.column.0 < 5);
     }
 }
+
