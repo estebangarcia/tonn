@@ -1,3 +1,22 @@
+## [1.2.0](https://github.com/estebangarcia/tonn/compare/v1.1.0...v1.2.0) (2026-10-29)
+
+### Features
+
+* add scroll speed setting and use native macOS wheel acceleration ([06167f6](https://github.com/estebangarcia/tonn/commit/06167f6380e41378e039d8ef2d6bbc182df6c6bb))
+* freeze scrolled-back panes and show scroll position badge ([bbcf18a](https://github.com/estebangarcia/tonn/commit/bbcf18a7cb1120cc1f5e7f7ab2a241e03033e6d6))
+* search pane text with Cmd+F / Ctrl+Shift+F ([5072231](https://github.com/estebangarcia/tonn/commit/50722313e2beb4eb1c3c80b3fb0de73bbcccf2c3))
+* show descriptive session titles like the Claude Code VS Code extension ([becc496](https://github.com/estebangarcia/tonn/commit/becc4966442084f63196dc7734c7003d51aa9a09))
+
+### Bug Fixes
+
+* forward mouse and focus events to TUIs and keep inline history in scrollback ([84daa91](https://github.com/estebangarcia/tonn/commit/84daa914590f6e133bfa57dd3d61a800fae0c664))
+* keep panes responsive after quitting full-screen apps in a resized pane ([fb3f97a](https://github.com/estebangarcia/tonn/commit/fb3f97ae8e1f1f706abb01d0af4f360cb5ca08f2))
+* only bracket pastes when the app enables bracketed paste ([87c3f4a](https://github.com/estebangarcia/tonn/commit/87c3f4aec69226dee07ad78204a6e60425a8055e))
+* only target visible panes for focus while a pane is zoomed ([11e4d43](https://github.com/estebangarcia/tonn/commit/11e4d435a9233acd754b316f65e4526df439e025))
+* pin semantic-release plugins ([a24c736](https://github.com/estebangarcia/tonn/commit/a24c736ef2cb1ab0a27f6d5a47a3ef7f2599be12))
+* release GPU resources before the event loop exits to avoid Wayland segfault ([ebb48c9](https://github.com/estebangarcia/tonn/commit/ebb48c94102532428491a28a03d627f9c88c6529))
+* stop session watcher CPU spin and bound per-command output memory ([52abe3e](https://github.com/estebangarcia/tonn/commit/52abe3e857af9769eb3e5906efe9d11cc85fa00c))
+
 ## [1.1.0](https://github.com/estebangarcia/tonn/compare/v1.0.4...v1.1.0) (2026-04-14)
 
 ### Features
