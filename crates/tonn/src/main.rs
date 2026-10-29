@@ -481,6 +481,9 @@ struct App {
     last_slow_update: Option<std::time::Instant>,
     last_unfocused_redraw: Option<std::time::Instant>,
     window_focused: bool,
+    /// The MCP server was started (and registration with Claude Code
+    /// attempted), so it must be deregistered on exit.
+    mcp_started: bool,
 }
 
 impl App {
@@ -512,6 +515,7 @@ impl App {
             last_slow_update: None,
             last_unfocused_redraw: None,
             window_focused: true,
+            mcp_started: false,
         }
     }
 
@@ -842,6 +846,21 @@ impl MouseGrab {
 // ---------------------------------------------------------------------------
 
 impl ApplicationHandler<UserEvent> for App {
+    /// Runs once on every exit path (last pane closed, window closed, startup
+    /// failure) while the event loop — and on Wayland the display connection —
+    /// is still alive. GPU resources must be released here: `run_app` drops
+    /// the event loop, closing the Wayland connection, before `App` itself is
+    /// dropped, and wgpu's surface/device destructors call into libwayland,
+    /// which segfaults on a closed connection (issue #3).
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.mcp_started {
+            deregister_mcp();
+        }
+        // Renderer (surface, device, queue) before the window it renders to.
+        self.renderer = None;
+        self.window = None;
+    }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::PtyExited(pane_id) => {
@@ -849,7 +868,6 @@ impl ApplicationHandler<UserEvent> for App {
                     mux.close_pane(pane_id);
                     if mux.tab_count() == 0 {
                         tracing::info!("All tabs closed, exiting");
-                        deregister_mcp();
                         event_loop.exit();
                         return;
                     }
@@ -1121,6 +1139,7 @@ impl ApplicationHandler<UserEvent> for App {
                         });
                     })
                     .expect("Failed to spawn MCP server thread");
+                self.mcp_started = mcp_port.is_some();
             }
             Err(e) => {
                 tracing::error!("Failed to initialize renderer: {e}");
@@ -1137,7 +1156,6 @@ impl ApplicationHandler<UserEvent> for App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                deregister_mcp();
                 event_loop.exit();
             }
 
