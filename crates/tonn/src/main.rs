@@ -15,7 +15,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use nex_common::{PaneId, CELL_WIDTH_RATIO, LINE_HEIGHT_RATIO, PADDING};
-use nex_mux::{Mux, MuxEventProxy, Rect, SplitDirection, DEFAULT_TAB_TITLE};
+use nex_mux::{Mux, MuxEventProxy, Pane, Rect, SplitDirection, DEFAULT_TAB_TITLE};
 use nex_render::renderer::{BgCell, PaneContent, Renderer, RenderSpan, SelectionCell, SettingsFieldType, DEFAULT_FONT_SIZE, FONT_SIZE_STEP};
 
 // UI constants
@@ -24,7 +24,7 @@ const TAB_BAR_HEIGHT_LOGICAL: f32 = 28.0;
 const BELL_FLASH_DURATION_MS: u64 = 150;
 const DEFAULT_WINDOW_WIDTH: u32 = 960;
 const DEFAULT_WINDOW_HEIGHT: u32 = 640;
-const SCROLL_LINE_MULTIPLIER: i32 = 3;
+const SCROLL_LINE_MULTIPLIER: f64 = 3.0;
 const SCROLL_PIXEL_DIVISOR: f64 = 20.0;
 const RESIZE_DEBOUNCE_MS: u64 = 50;
 const DIVIDER_RENDER_THICKNESS: f32 = 4.0;
@@ -32,9 +32,10 @@ const EXECUTE_STDOUT_MAX_CHARS: usize = 4000;
 const EXECUTE_STDERR_MAX_CHARS: usize = 2000;
 const UNFOCUSED_REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 use nex_terminal::{
-    Column, Line, Point, Selection, SelectionType, Side,
+    Column, Line, Point, Selection, SelectionType, Side, TermMode,
     read_grid_content,
 };
+use nex_terminal::mouse::{self, MouseButton as TermMouseButton, MouseEvent, MouseEventKind, WheelAction};
 
 // ---------------------------------------------------------------------------
 // UserEvent + MuxEventProxy bridge
@@ -443,6 +444,14 @@ struct App {
     modifiers: Modifiers,
     mouse_pos: (f64, f64),
     mouse_selecting: bool,
+    /// Fractional wheel lines carried over between trackpad events.
+    scroll_accumulator: f64,
+    /// Reported press whose drag/release is still owed to its pane.
+    mouse_grab: Option<MouseGrab>,
+    /// Cell of the last motion report, so motion is reported once per cell.
+    last_mouse_cell: Option<(usize, usize)>,
+    /// Last (pane, window focused) state sent as a DECSET 1004 focus report.
+    focus_reported: Option<(PaneId, bool)>,
     bell_flash_until: Option<std::time::Instant>,
     tab_switcher: Option<TabSwitcher>,
     session_browser: Option<SessionBrowser>,
@@ -470,6 +479,10 @@ impl App {
             modifiers: Modifiers::default(),
             mouse_pos: (0.0, 0.0),
             mouse_selecting: false,
+            scroll_accumulator: 0.0,
+            mouse_grab: None,
+            last_mouse_cell: None,
+            focus_reported: None,
             bell_flash_until: None,
             tab_switcher: None,
             session_browser: None,
@@ -496,10 +509,10 @@ impl App {
         Rect { x: 0.0, y: tab_h, width: w as f32, height: h as f32 - tab_h }
     }
 
-    /// Convert pixel position to terminal grid point, relative to the focused pane.
-    fn pixel_to_grid(&self, x: f64, y: f64) -> Option<(Point, Side)> {
-        let mux = self.mux.as_ref()?;
-        let pane = mux.focused_pane()?;
+    /// Viewport cell `(col, row)` under a pixel in `pane`, clamped to its
+    /// grid, plus which half of the cell the pixel falls in. Ignores the
+    /// scrollback offset — this is what mouse reports use.
+    fn pixel_to_cell(&self, pane: &Pane, x: f64, y: f64) -> Option<(usize, usize, Side)> {
         let renderer = self.renderer.as_ref()?;
         let physical_font = renderer.font_size() * renderer.scale_factor();
         let cell_width = physical_font * CELL_WIDTH_RATIO;
@@ -514,27 +527,249 @@ impl App {
         let col = col.min(pane.term_size.cols.saturating_sub(1) as usize);
         let row = row.min(pane.term_size.rows.saturating_sub(1) as usize);
 
-        let display_offset = pane.terminal.lock().grid().display_offset();
-        let line = Line(row as i32 - display_offset as i32);
         let side = if local_x > PADDING && (local_x - PADDING) % cell_width > cell_width / 2.0 {
             Side::Right
         } else {
             Side::Left
         };
 
+        Some((col, row, side))
+    }
+
+    /// Grid point (honouring the scrollback offset) under a pixel in the
+    /// focused pane — what selection uses.
+    fn pixel_to_grid(&self, x: f64, y: f64) -> Option<(Point, Side)> {
+        let pane = self.mux.as_ref()?.focused_pane()?;
+        let (col, row, side) = self.pixel_to_cell(pane, x, y)?;
+        let display_offset = pane.terminal.lock().grid().display_offset();
+        let line = Line(row as i32 - display_offset as i32);
         Some((Point::new(line, Column(col)), side))
+    }
+
+    /// Viewport cell under the mouse pointer, relative to `pane`.
+    fn pointer_cell(&self, pane: &Pane) -> Option<(usize, usize)> {
+        self.pixel_to_cell(pane, self.mouse_pos.0, self.mouse_pos.1)
+            .map(|(col, row, _)| (col, row))
+    }
+
+    fn focused_mode(&self) -> Option<TermMode> {
+        Some(self.mux.as_ref()?.focused_pane()?.terminal.lock().mode())
+    }
+
+    fn key_modifiers(&self) -> nex_terminal::keys::Modifiers {
+        let state = self.modifiers.state();
+        nex_terminal::keys::Modifiers {
+            shift: state.shift_key(),
+            ctrl: state.control_key(),
+            alt: state.alt_key(),
+        }
+    }
+
+    /// Whether an overlay (settings, session browser, tab switcher) covers
+    /// the panes. Overlays own the pointer: nothing reaches the hidden
+    /// terminal, mirroring how they already own the keyboard.
+    fn overlay_open(&self) -> bool {
+        self.settings_panel.is_some() || self.session_browser.is_some() || self.tab_switcher.is_some()
+    }
+
+    /// Encode a mouse report for `pane` at the pointer's cell, or `None` when
+    /// the app's tracking mode doesn't want this event.
+    fn mouse_report(&self, pane: &Pane, kind: MouseEventKind, button: Option<TermMouseButton>) -> Option<Vec<u8>> {
+        let mode = pane.terminal.lock().mode();
+        let (col, row) = self.pointer_cell(pane)?;
+        let event = MouseEvent { button, kind, col, row, mods: self.key_modifiers() };
+        mouse::encode(&event, mode)
+    }
+
+    /// Convert a wheel delta into whole lines (positive = towards history),
+    /// carrying fractional movement over to the next event so slow trackpad
+    /// scrolls aren't rounded up to a line per event.
+    fn wheel_lines(&mut self, delta: MouseScrollDelta) -> i32 {
+        self.scroll_accumulator += match delta {
+            MouseScrollDelta::LineDelta(_, y) => f64::from(y) * SCROLL_LINE_MULTIPLIER,
+            MouseScrollDelta::PixelDelta(pos) => pos.y / SCROLL_PIXEL_DIVISOR,
+        };
+        let lines = self.scroll_accumulator.trunc();
+        self.scroll_accumulator -= lines;
+        lines as i32
+    }
+
+    /// Route wheel lines to the focused pane's app (mouse reports or
+    /// alternate-scroll arrow keys) or to Tonn's own scrollback.
+    fn handle_wheel(&self, lines: i32) {
+        if self.overlay_open() {
+            return;
+        }
+        let Some(pane) = self.mux.as_ref().and_then(|m| m.focused_pane()) else { return };
+        let mode = pane.terminal.lock().mode();
+        let steps = lines.unsigned_abs() as usize;
+        let towards_history = lines > 0;
+
+        match mouse::wheel_action(mode, self.modifiers.state().shift_key()) {
+            WheelAction::Report => {
+                let button = if towards_history { TermMouseButton::WheelUp } else { TermMouseButton::WheelDown };
+                if let Some(report) = self.mouse_report(pane, MouseEventKind::Press, Some(button)) {
+                    write_to_pane(pane, &report.repeat(steps));
+                }
+            }
+            WheelAction::ArrowKeys => {
+                use nex_terminal::keys::{Key as K, NamedKey as NK};
+                let key = K::Named(if towards_history { NK::ArrowUp } else { NK::ArrowDown });
+                let key_mode = nex_terminal::keys::Mode { app_cursor: mode.contains(TermMode::APP_CURSOR) };
+                let no_mods = nex_terminal::keys::Modifiers::default();
+                if let Some(bytes) = nex_terminal::keys::encode(&key, &no_mods, &key_mode) {
+                    write_to_pane(pane, &bytes.repeat(steps));
+                }
+            }
+            WheelAction::Scrollback => {
+                pane.terminal.lock().grid_mut().scroll_display(
+                    nex_terminal::Scroll::Delta(lines),
+                );
+                pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Mouse button press/release: report it to the app when it tracks the
+    /// mouse (Shift bypasses), otherwise drive Tonn's own selection.
+    fn handle_mouse_button(&mut self, state: ElementState, button: MouseButton) {
+        let Some(button) = map_winit_button(button) else { return };
+
+        match state {
+            ElementState::Pressed => {
+                if self.overlay_open() {
+                    return;
+                }
+                if let Some(mux) = &mut self.mux {
+                    mux.focus_pane_at_pixel(self.mouse_pos.0 as f32, self.mouse_pos.1 as f32);
+                }
+                let Some(pane) = self.mux.as_ref().and_then(|m| m.focused_pane()) else { return };
+
+                let shift = self.modifiers.state().shift_key();
+                let report = if shift { None } else { self.mouse_report(pane, MouseEventKind::Press, Some(button)) };
+                if let Some(report) = report {
+                    write_to_pane(pane, &report);
+                    pane.terminal.lock().selection = None;
+                    let grab = MouseGrab { pane: pane.id, button };
+                    let cell = self.pointer_cell(pane);
+                    self.mouse_grab = Some(grab);
+                    self.last_mouse_cell = cell;
+                } else if button == TermMouseButton::Left {
+                    if let Some((point, side)) = self.pixel_to_grid(self.mouse_pos.0, self.mouse_pos.1) {
+                        pane.terminal.lock().selection =
+                            Some(Selection::new(SelectionType::Simple, point, side));
+                    }
+                    self.mouse_selecting = true;
+                }
+            }
+            ElementState::Released => {
+                // Always end a grab — even under an overlay or after focus
+                // moved — so the app never sees a press without its release.
+                if let Some(pane_id) = MouseGrab::release(&mut self.mouse_grab, button)
+                    && let Some(pane) = self.mux.as_ref().and_then(|m| m.pane(pane_id))
+                    && let Some(report) = self.mouse_report(pane, MouseEventKind::Release, Some(button))
+                {
+                    write_to_pane(pane, &report);
+                }
+                if button == TermMouseButton::Left {
+                    self.mouse_selecting = false;
+                }
+            }
+        }
+
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Report pointer motion (1002 drag / 1003 any-motion) once per cell —
+    /// to the grabbing pane during a reported drag, else the focused pane.
+    /// Suppressed while Tonn itself is selecting or an overlay is open.
+    fn handle_mouse_motion(&mut self) {
+        if self.mouse_selecting || self.overlay_open() {
+            return;
+        }
+        let Some(focused) = self.mux.as_ref().map(|m| m.focused_pane_id()) else { return };
+        let (pane_id, held) = MouseGrab::motion_target(self.mouse_grab, focused);
+        let Some(pane) = self.mux.as_ref().and_then(|m| m.pane(pane_id)) else { return };
+
+        let cell = self.pointer_cell(pane);
+        if cell == self.last_mouse_cell {
+            return;
+        }
+        if let Some(report) = self.mouse_report(pane, MouseEventKind::Motion, held) {
+            write_to_pane(pane, &report);
+        }
+        self.last_mouse_cell = cell;
+    }
+
+    /// Send DECSET 1004 focus reports when the focused pane or the window
+    /// focus changed since the last report. Called after every event so
+    /// clicks, pane cycling, splits, closes and window focus are all covered.
+    fn sync_focus_reports(&mut self) {
+        let current = self.mux.as_ref().map(|m| (m.focused_pane_id(), self.window_focused));
+        if current == self.focus_reported {
+            return;
+        }
+        if let Some((pane_id, true)) = self.focus_reported {
+            self.send_focus_report(pane_id, false);
+        }
+        if let Some((pane_id, true)) = current {
+            self.send_focus_report(pane_id, true);
+        }
+        self.focus_reported = current;
+    }
+
+    fn send_focus_report(&self, pane_id: PaneId, focused: bool) {
+        let Some(pane) = self.mux.as_ref().and_then(|m| m.pane(pane_id)) else { return };
+        if pane.terminal.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
+            write_to_pane(pane, mouse::focus_report(focused));
+        }
     }
 
     /// Write bytes to the focused pane's PTY.
     fn write_to_focused(&self, data: &[u8]) -> bool {
-        if let Some(writer) = self.mux.as_ref().and_then(|m| m.focused_pane_writer()) {
-            let mut w = writer.lock();
-            let _ = w.write_all(data);
-            let _ = w.flush();
-            true
-        } else {
-            false
+        match self.mux.as_ref().and_then(|m| m.focused_pane()) {
+            Some(pane) => {
+                write_to_pane(pane, data);
+                true
+            }
+            None => false,
         }
+    }
+}
+
+/// Write bytes to a pane's PTY.
+fn write_to_pane(pane: &Pane, data: &[u8]) {
+    let mut writer = pane.pty_writer.lock();
+    let _ = writer.write_all(data);
+    let _ = writer.flush();
+}
+
+/// A mouse press that was reported to an application. Like an X11 pointer
+/// grab, drag motion and the release go to the pane that got the press, even
+/// if focus moves to another pane mid-gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MouseGrab {
+    pane: PaneId,
+    button: TermMouseButton,
+}
+
+impl MouseGrab {
+    /// Pane and held button that pointer motion should be reported to.
+    fn motion_target(grab: Option<Self>, focused: PaneId) -> (PaneId, Option<TermMouseButton>) {
+        match grab {
+            Some(grab) => (grab.pane, Some(grab.button)),
+            None => (focused, None),
+        }
+    }
+
+    /// End the grab if `button` is the grabbed one, returning the pane its
+    /// release belongs to. Releases of other buttons leave the grab intact.
+    fn release(grab: &mut Option<Self>, button: TermMouseButton) -> Option<PaneId> {
+        let pane = grab.filter(|g| g.button == button)?.pane;
+        *grab = None;
+        Some(pane)
     }
 }
 
@@ -656,6 +891,7 @@ impl ApplicationHandler<UserEvent> for App {
                 });
             }
         }
+        self.sync_focus_reports();
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -887,26 +1123,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let scroll_lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y as i32 * SCROLL_LINE_MULTIPLIER,
-                    MouseScrollDelta::PixelDelta(pos) => {
-                        let lines = pos.y / SCROLL_PIXEL_DIVISOR;
-                        if lines.abs() < 1.0 && lines != 0.0 {
-                            lines.signum() as i32
-                        } else {
-                            lines as i32
-                        }
-                    }
-                };
-                if scroll_lines != 0
-                    && let Some(mux) = &self.mux
-                        && let Some(pane) = mux.focused_pane() {
-                            let mut term = pane.terminal.lock();
-                            term.grid_mut().scroll_display(
-                                nex_terminal::Scroll::Delta(scroll_lines),
-                            );
-                            pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
+                let lines = self.wheel_lines(delta);
+                if lines != 0 {
+                    self.handle_wheel(lines);
+                }
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -914,6 +1134,7 @@ impl ApplicationHandler<UserEvent> for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x, position.y);
+                self.handle_mouse_motion();
                 if self.mouse_selecting {
                     if let Some((point, side)) = self.pixel_to_grid(position.x, position.y)
                         && let Some(mux) = &self.mux
@@ -929,29 +1150,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                match state {
-                    ElementState::Pressed => {
-                        // Focus pane at click position
-                        if let Some(mux) = &mut self.mux {
-                            mux.focus_pane_at_pixel(self.mouse_pos.0 as f32, self.mouse_pos.1 as f32);
-                        }
-                        // Start selection
-                        if let Some((point, side)) = self.pixel_to_grid(self.mouse_pos.0, self.mouse_pos.1)
-                            && let Some(mux) = &self.mux
-                                && let Some(pane) = mux.focused_pane() {
-                                    pane.terminal.lock().selection =
-                                        Some(Selection::new(SelectionType::Simple, point, side));
-                                }
-                        self.mouse_selecting = true;
-                    }
-                    ElementState::Released => {
-                        self.mouse_selecting = false;
-                        if let Some(window) = &self.window {
-                            window.request_redraw();
-                        }
-                    }
-                }
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.handle_mouse_button(state, button);
             }
 
             WindowEvent::ModifiersChanged(new_modifiers) => {
@@ -994,6 +1194,7 @@ impl ApplicationHandler<UserEvent> for App {
 
             _ => {}
         }
+        self.sync_focus_reports();
     }
 }
 
@@ -1022,7 +1223,6 @@ impl App {
         let ctrl = self.modifiers.state().control_key();
         let super_key = self.modifiers.state().super_key();
         let shift = self.modifiers.state().shift_key();
-        let alt = self.modifiers.state().alt_key();
 
         // --- Settings panel (Cmd+,) ---
         if super_key && matches!(logical_key, Key::Character(c) if c.as_str() == ",") {
@@ -1344,16 +1544,10 @@ impl App {
         // --- PTY input ---
         let key_input = map_winit_key(logical_key, text);
         let wrote = if let Some(ref key_input) = key_input {
-            let mods = nex_terminal::keys::Modifiers { shift, ctrl, alt };
-            let mode = self.mux.as_ref()
-                .and_then(|m| m.focused_pane())
-                .map(|p| {
-                    let term = p.terminal.lock();
-                    nex_terminal::keys::Mode {
-                        app_cursor: term.mode().contains(nex_terminal::TermMode::APP_CURSOR),
-                    }
-                })
-                .unwrap_or_default();
+            let mods = self.key_modifiers();
+            let mode = nex_terminal::keys::Mode {
+                app_cursor: self.focused_mode().is_some_and(|m| m.contains(TermMode::APP_CURSOR)),
+            };
             if let Some(data) = nex_terminal::keys::encode(key_input, &mods, &mode) {
                 self.write_to_focused(&data)
             } else {
@@ -1405,6 +1599,16 @@ fn map_winit_key(key: &Key, text: Option<&str>) -> Option<nex_terminal::keys::Ke
         Key::Named(NamedKey::F12) => Some(K::Named(NK::F(12))),
         Key::Character(c) => c.chars().next().map(K::Char),
         _ => text.and_then(|t| t.chars().next()).map(K::Char),
+    }
+}
+
+/// Convert a winit mouse button into the terminal's mouse-report button.
+fn map_winit_button(button: MouseButton) -> Option<TermMouseButton> {
+    match button {
+        MouseButton::Left => Some(TermMouseButton::Left),
+        MouseButton::Middle => Some(TermMouseButton::Middle),
+        MouseButton::Right => Some(TermMouseButton::Right),
+        _ => None,
     }
 }
 
@@ -2097,4 +2301,42 @@ fn main() -> Result<()> {
     event_loop.run_app(&mut app)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grab(pane: PaneId, button: TermMouseButton) -> Option<MouseGrab> {
+        Some(MouseGrab { pane, button })
+    }
+
+    #[test]
+    fn drag_and_release_stay_with_pressing_pane_after_focus_moves() {
+        let (pressed, focused_now) = (PaneId::new(), PaneId::new());
+        let mut active = grab(pressed, TermMouseButton::Left);
+
+        assert_eq!(
+            MouseGrab::motion_target(active, focused_now),
+            (pressed, Some(TermMouseButton::Left)),
+        );
+        assert_eq!(MouseGrab::release(&mut active, TermMouseButton::Left), Some(pressed));
+        assert_eq!(active, None);
+    }
+
+    #[test]
+    fn releasing_another_button_keeps_the_grab() {
+        let pressed = PaneId::new();
+        let mut active = grab(pressed, TermMouseButton::Left);
+        assert_eq!(MouseGrab::release(&mut active, TermMouseButton::Right), None);
+        assert_eq!(active, grab(pressed, TermMouseButton::Left));
+    }
+
+    #[test]
+    fn without_grab_motion_is_hover_on_focused_pane_and_release_is_unowned() {
+        let focused = PaneId::new();
+        let mut active = None;
+        assert_eq!(MouseGrab::motion_target(active, focused), (focused, None));
+        assert_eq!(MouseGrab::release(&mut active, TermMouseButton::Left), None);
+    }
 }

@@ -1,6 +1,7 @@
 //! A single terminal pane: owns PTY, Term, and I/O threads.
 
-use std::io::{Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
@@ -19,6 +20,18 @@ use nex_shell_integration::{OscScanner, ShellState};
 use crate::{MuxEventProxy, Rect};
 
 const IO_BUFFER_SIZE: usize = 8192;
+
+/// Set (to any value) to capture each pane's raw PTY traffic in the temp
+/// dir: `-out.bin` is what the app sent, `-in.bin` is what Tonn sent back
+/// (keys, paste, mouse/focus reports, query replies). The input trace holds
+/// everything typed — including passwords entered with echo off.
+const DEBUG_PTY_ENV: &str = "TONN_DEBUG_PTY";
+/// Owner-only permissions for trace files (they can contain secrets).
+#[cfg(unix)]
+const DEBUG_PTY_FILE_MODE: u32 = 0o600;
+const DEBUG_PTY_FILE_PREFIX: &str = "tonn-pty";
+const DEBUG_PTY_OUTPUT_SUFFIX: &str = "out.bin";
+const DEBUG_PTY_INPUT_SUFFIX: &str = "in.bin";
 
 /// A terminal pane with its own PTY and VT emulator.
 pub struct Pane {
@@ -48,6 +61,14 @@ impl Pane {
         let pane_id = PaneId::new();
         let dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (pty, reader, writer) = NexPty::spawn(shell, size, mcp_port)?;
+
+        let trace_pty = std::env::var_os(DEBUG_PTY_ENV).is_some();
+        let writer: Box<dyn Write + Send> =
+            match trace_pty.then(|| open_pty_trace(pane_id, DEBUG_PTY_INPUT_SUFFIX)).flatten() {
+                Some(trace) => Box::new(TeeWriter { inner: writer, trace }),
+                None => writer,
+            };
+        let output_trace = trace_pty.then(|| open_pty_trace(pane_id, DEBUG_PTY_OUTPUT_SUFFIX)).flatten();
         let pty_writer = Arc::new(Mutex::new(writer));
 
         // Channel for PtyWrite events (DSR responses)
@@ -83,7 +104,7 @@ impl Pane {
         let _io_thread = std::thread::Builder::new()
             .name(format!("io-{pane_id}"))
             .spawn(move || {
-                io_thread(pane_id, reader, io_terminal, io_proxy, block_event_tx, io_dirty);
+                io_thread(pane_id, reader, io_terminal, io_proxy, block_event_tx, io_dirty, output_trace);
             })
             .expect("Failed to spawn I/O thread");
 
@@ -124,6 +145,7 @@ fn io_thread<Proxy: MuxEventProxy>(
     event_proxy: Proxy,
     block_event_tx: Sender<BlockEvent>,
     dirty: Arc<std::sync::atomic::AtomicBool>,
+    mut output_trace: Option<File>,
 ) {
     let mut processor = ansi::Processor::<ansi::StdSyncHandler>::new();
     let mut osc_scanner = OscScanner::new();
@@ -140,16 +162,8 @@ fn io_thread<Proxy: MuxEventProxy>(
             Ok(n) => {
                 let data = &buf[..n];
 
-                // Debug: dump raw PTY bytes to a file when TONN_DEBUG_PTY is set.
-                if std::env::var("TONN_DEBUG_PTY").is_ok() {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/tonn-pty-dump.bin")
-                    {
-                        let _ = f.write_all(data);
-                    }
+                if let Some(trace) = &mut output_trace {
+                    let _ = trace.write_all(data);
                 }
 
                 // Scan for OSC sequences and emit BlockEvents
@@ -199,5 +213,78 @@ fn io_thread<Proxy: MuxEventProxy>(
                 break;
             }
         }
+    }
+}
+
+/// Open a per-pane PTY trace file in the temp dir (see `DEBUG_PTY_ENV`).
+///
+/// Always a brand-new file (`create_new` → `O_EXCL`, which also refuses to
+/// follow a planted symlink) created owner-only, so a shared `/tmp` never
+/// exposes captured input and an existing file is never appended to. Pane
+/// ids are UUIDs, so names don't collide across runs.
+fn open_pty_trace(pane_id: PaneId, suffix: &str) -> Option<File> {
+    let path = std::env::temp_dir().join(format!("{DEBUG_PTY_FILE_PREFIX}-{pane_id}-{suffix}"));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(DEBUG_PTY_FILE_MODE);
+    }
+    match options.open(&path) {
+        Ok(file) => {
+            tracing::warn!(
+                %pane_id,
+                path = %path.display(),
+                "PTY trace enabled — the input trace records everything typed, including passwords",
+            );
+            Some(file)
+        }
+        Err(e) => {
+            tracing::warn!(%pane_id, path = %path.display(), "Cannot open PTY trace: {e}");
+            None
+        }
+    }
+}
+
+/// PTY writer that also copies every byte written to a trace file.
+struct TeeWriter {
+    inner: Box<dyn Write + Send>,
+    trace: File,
+}
+
+impl Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        let _ = self.trace.write_all(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const TEST_SUFFIX: &str = "test.bin";
+    const PERMISSION_BITS: u32 = 0o777;
+
+    #[test]
+    fn pty_trace_is_owner_only_and_never_reused() {
+        let pane_id = PaneId::new();
+        let path = std::env::temp_dir().join(format!("{DEBUG_PTY_FILE_PREFIX}-{pane_id}-{TEST_SUFFIX}"));
+
+        let file = open_pty_trace(pane_id, TEST_SUFFIX).expect("trace file created");
+        let mode = file.metadata().unwrap().permissions().mode() & PERMISSION_BITS;
+        assert_eq!(mode, DEBUG_PTY_FILE_MODE);
+
+        // An existing file (ours, or one planted by someone else) is refused.
+        assert!(open_pty_trace(pane_id, TEST_SUFFIX).is_none());
+
+        std::fs::remove_file(path).unwrap();
     }
 }

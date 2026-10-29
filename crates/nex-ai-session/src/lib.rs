@@ -7,6 +7,7 @@
 
 pub mod claude_code;
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -183,11 +184,11 @@ fn build_tree(sessions: Vec<AiSession>) -> Vec<SessionNode> {
             .into_iter()
             .map(|child| build_node(child, children_map))
             .collect();
-        children.sort_by(|a, b| b.session.updated_at.cmp(&a.session.updated_at));
+        children.sort_by_key(|c| Reverse(c.session.updated_at));
         SessionNode { session, children }
     }
 
-    roots.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    roots.sort_by_key(|r| Reverse(r.updated_at));
     roots
         .into_iter()
         .map(|s| build_node(s, &mut children_map))
@@ -239,7 +240,7 @@ impl SessionManager {
     pub fn all_sessions_sorted(&self) -> Vec<AiSession> {
         let mut sessions: Vec<AiSession> =
             self.sessions.iter().map(|entry| entry.value().clone()).collect();
-        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sessions.sort_by_key(|s| Reverse(s.updated_at));
         sessions
     }
 
@@ -259,7 +260,7 @@ impl SessionManager {
             })
             .map(|entry| entry.value().clone())
             .collect();
-        results.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        results.sort_by_key(|r| Reverse(r.updated_at));
         results
     }
 
@@ -323,7 +324,7 @@ impl SessionManager {
             })
             .collect();
 
-        trees.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+        trees.sort_by_key(|t| Reverse(t.last_activity));
         trees
     }
 

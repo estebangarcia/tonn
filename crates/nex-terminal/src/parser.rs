@@ -268,11 +268,12 @@ impl<L: EventListener> Handler<'_, L> {
                 7 => self.term.set_mode(TermMode::LINE_WRAP, enable),
                 25 => self.term.set_mode(TermMode::SHOW_CURSOR, enable),
                 47 | 1047 => self.term.swap_alt_screen(enable, false),
-                1000 => self.term.set_mode(TermMode::MOUSE_REPORT_CLICK, enable),
-                1002 => self.term.set_mode(TermMode::MOUSE_DRAG, enable),
-                1003 => self.term.set_mode(TermMode::MOUSE_MOTION, enable),
+                1000 => self.set_mouse_mode(TermMode::MOUSE_REPORT_CLICK, enable),
+                1002 => self.set_mouse_mode(TermMode::MOUSE_DRAG, enable),
+                1003 => self.set_mouse_mode(TermMode::MOUSE_MOTION, enable),
                 1004 => self.term.set_mode(TermMode::FOCUS_IN_OUT, enable),
                 1006 => self.term.set_mode(TermMode::SGR_MOUSE, enable),
+                1007 => self.term.set_mode(TermMode::ALTERNATE_SCROLL, enable),
                 1048 => {
                     if enable {
                         self.term.save_cursor();
@@ -290,6 +291,15 @@ impl<L: EventListener> Handler<'_, L> {
                 _ => tracing::trace!(code, enable, "unhandled private mode"),
             }
         }
+    }
+
+    /// Mouse tracking levels are mutually exclusive: enabling one replaces
+    /// whichever level was active before.
+    fn set_mouse_mode(&mut self, level: TermMode, enable: bool) {
+        if enable {
+            self.term.set_mode(TermMode::MOUSE_MODE, false);
+        }
+        self.term.set_mode(level, enable);
     }
 
     // -----------------------------------------------------------------
@@ -683,6 +693,58 @@ mod tests {
         let mut t = term(20, 3);
         feed(&mut t, b"\x1b[?2004h");
         assert!(t.mode().contains(TermMode::BRACKETED_PASTE));
+    }
+
+    #[test]
+    fn alternate_scroll_mode_toggles() {
+        let mut t = term(20, 3);
+        assert!(t.mode().contains(TermMode::ALTERNATE_SCROLL), "on by default");
+        feed(&mut t, b"\x1b[?1007l");
+        assert!(!t.mode().contains(TermMode::ALTERNATE_SCROLL));
+        feed(&mut t, b"\x1b[?1007h");
+        assert!(t.mode().contains(TermMode::ALTERNATE_SCROLL));
+    }
+
+    #[test]
+    fn mouse_tracking_levels_are_exclusive() {
+        let mut t = term(20, 3);
+        feed(&mut t, b"\x1b[?1000h\x1b[?1006h");
+        assert!(t.mode().contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(t.mode().contains(TermMode::SGR_MOUSE));
+
+        feed(&mut t, b"\x1b[?1003h");
+        assert!(t.mode().contains(TermMode::MOUSE_MOTION));
+        assert!(!t.mode().contains(TermMode::MOUSE_REPORT_CLICK));
+
+        feed(&mut t, b"\x1b[?1003l");
+        assert!(!t.mode().intersects(TermMode::MOUSE_MODE));
+        assert!(t.mode().contains(TermMode::SGR_MOUSE), "encoding flag is independent");
+    }
+
+    #[test]
+    fn inline_history_insert_lands_in_scrollback() {
+        // Byte pattern Codex's inline mode uses to insert transcript lines
+        // above its viewport (rows 4..5): limit the scroll region to the
+        // rows above the viewport, park at its bottom, emit CRLF + text.
+        let mut t = term(10, 5);
+        feed(&mut t, b"\x1b[4;1Hview\x1b[5;1Hport");
+        feed(&mut t, b"\x1b[1;3r\x1b[3;1H");
+        for line in [b"one", b"two", b"six", b"ten"] {
+            feed(&mut t, b"\r\n");
+            feed(&mut t, line);
+        }
+        feed(&mut t, b"\x1b[r");
+
+        let text = |l: i32| -> String {
+            t.grid()[Line(l)].cells.iter().take(4).map(|c| c.c).collect()
+        };
+        assert_eq!(t.grid().history_size(), 4);
+        assert_eq!(text(-1), "one ", "first transcript line scrolled into history");
+        assert_eq!(text(0), "two ");
+        assert_eq!(text(1), "six ");
+        assert_eq!(text(2), "ten ");
+        assert_eq!(text(3), "view", "viewport rows stay in place");
+        assert_eq!(text(4), "port");
     }
 
     #[test]

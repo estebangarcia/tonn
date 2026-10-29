@@ -423,8 +423,12 @@ impl Mux {
 
     // --- Accessors ---
 
+    pub fn pane(&self, pane_id: PaneId) -> Option<&Pane> {
+        self.panes.get(&pane_id)
+    }
+
     pub fn focused_pane(&self) -> Option<&Pane> {
-        self.panes.get(&self.focused_pane)
+        self.pane(self.focused_pane)
     }
 
     pub fn focused_pane_writer(&self) -> Option<Arc<Mutex<Box<dyn Write + Send>>>> {

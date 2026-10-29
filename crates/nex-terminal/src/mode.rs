@@ -1,9 +1,10 @@
 //! Terminal mode flags (DECSET/DECRST state).
 
 bitflags::bitflags! {
-    /// Terminal mode flags. Only `APP_CURSOR`, `ALT_SCREEN`, `LINE_WRAP`,
-    /// `BRACKETED_PASTE`, and `SHOW_CURSOR` are actively used by Tonn today.
-    /// The rest are tracked so DECSET/DECRST does not report false state.
+    /// Terminal mode flags set by DECSET/DECRST. Tonn acts on cursor/keypad,
+    /// wrap, alt screen, bracketed paste, mouse tracking (`MOUSE_*`,
+    /// `SGR_MOUSE`), alternate scroll and focus reporting. The rest are
+    /// tracked so DECSET/DECRST does not report false state.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct TermMode: u32 {
         const SHOW_CURSOR        = 1 << 0;
@@ -22,6 +23,11 @@ bitflags::bitflags! {
         const MOUSE_DRAG         = 1 << 13;
         const UTF8_MOUSE         = 1 << 14;
         const ALTERNATE_SCROLL   = 1 << 15;
+        /// Any mouse tracking level (1000 / 1002 / 1003). The levels are
+        /// mutually exclusive, as in xterm.
+        const MOUSE_MODE = Self::MOUSE_REPORT_CLICK.bits()
+            | Self::MOUSE_DRAG.bits()
+            | Self::MOUSE_MOTION.bits();
     }
 }
 

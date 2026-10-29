@@ -1,6 +1,7 @@
 //! Terminal emulation for Tonn — from-scratch VT emulator built on `vte`.
 
 pub mod keys;
+pub mod mouse;
 
 pub mod ansi;
 pub mod cell;

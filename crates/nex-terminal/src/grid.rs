@@ -12,10 +12,14 @@
 //!
 //! # Scroll-up algorithm
 //!
-//! When the cursor advances past the bottom of the scroll region and the
-//! region is the entire screen, we append a blank row at the back of the deque
-//! and (if over the history limit) drop the oldest row from the front. The
-//! "screen top" index slides forward naturally — no rows move.
+//! When the cursor advances past the bottom of a scroll region whose top is
+//! the top of the screen, we insert a blank row directly below the region and
+//! (if over the history limit) drop the oldest row from the front. The
+//! "screen top" index slides forward, so the region's top row becomes
+//! scrollback while rows below the region keep their screen positions. For a
+//! full-screen region the insert point is the back of the deque — no rows
+//! move. Regions that don't start at the top are rotated in place and never
+//! touch scrollback.
 
 use std::collections::VecDeque;
 use std::ops::{Index, IndexMut, Range};
@@ -337,49 +341,77 @@ impl Grid {
     // Scrolling (DECSTBM scroll region)
     // ---------------------------------------------------------------------
 
-    /// Scroll the region up by `n` rows (lines move towards the top).
+    /// Scroll the region up by `n` rows (lines move towards the top). This is
+    /// the LF / IND / SU path.
     ///
-    /// When the region covers the whole screen, the scrolled-off rows go into
-    /// scrollback history. When the region is partial, rows within the region
-    /// are rotated in-place and the bottom `n` rows are cleared.
+    /// When the region's top is the top of the screen, the scrolled-off rows
+    /// are saved into scrollback — even if the region's bottom is above the
+    /// screen bottom. That matches xterm/alacritty/kitty, and inline TUIs
+    /// (e.g. Codex without the alt screen) rely on it to push transcript lines
+    /// into history from above a fixed viewport. Other regions are rotated
+    /// in place.
     pub fn scroll_up_region(&mut self, n: usize) {
-        let region_size = self.scroll_region.end - self.scroll_region.start;
-        let n = n.min(region_size);
+        if self.scroll_region.start == 0 {
+            self.scroll_into_history(n);
+        } else {
+            self.rotate_region_up(n);
+        }
+    }
+
+    /// Move the top `n` rows of a top-anchored scroll region into scrollback.
+    ///
+    /// Inserting `n` blank rows directly below the region shifts the screen
+    /// top forward by `n`: the region's top rows fall into history, the rest
+    /// of the region moves up, and rows below the region stay put.
+    fn scroll_into_history(&mut self, n: usize) {
+        let n = n.min(self.scroll_region.len());
         if n == 0 {
             return;
         }
 
-        let full_screen = self.scroll_region.start == 0 && self.scroll_region.end == self.screen_lines;
-        let template = self.cursor.template;
-
-        if full_screen {
-            for _ in 0..n {
-                let mut row = Row::new(self.cols);
-                row.clear_with(&template);
-                self.rows.push_back(row);
-                if self.rows.len() > self.history_limit + self.screen_lines {
-                    self.rows.pop_front();
-                }
-            }
-            // Reset display_offset to clamp to new history.
-            if self.display_offset > self.history_size() {
-                self.display_offset = self.history_size();
-            }
-        } else {
-            // Rotate within the region. Rows at [top..top+n) are dropped,
-            // rows at [top+n..bottom) slide up to [top..bottom-n), and
-            // rows [bottom-n..bottom) become blank.
-            let screen_top = self.rows.len() - self.screen_lines;
-            for i in self.scroll_region.start..(self.scroll_region.end - n) {
-                let src = screen_top + i + n;
-                let dst = screen_top + i;
-                self.rows.swap(src, dst);
-            }
-            for i in (self.scroll_region.end - n)..self.scroll_region.end {
-                let idx = screen_top + i;
-                self.rows[idx].clear_with(&template);
-            }
+        let insert_at = self.rows.len() - self.screen_lines + self.scroll_region.end;
+        let blank = self.blank_row();
+        for _ in 0..n {
+            self.rows.insert(insert_at, blank.clone());
         }
+        while self.rows.len() > self.history_limit + self.screen_lines {
+            self.rows.pop_front();
+        }
+
+        // Keep a scrolled-back viewport anchored on the content it shows.
+        if self.display_offset > 0 {
+            self.display_offset += n;
+        }
+        self.display_offset = self.display_offset.min(self.history_size());
+    }
+
+    /// Rotate the scroll region up by `n` rows in place: rows at
+    /// [top..top+n) are dropped, rows at [top+n..bottom) slide up, and the
+    /// bottom `n` rows become blank. Never touches scrollback.
+    fn rotate_region_up(&mut self, n: usize) {
+        let n = n.min(self.scroll_region.len());
+        if n == 0 {
+            return;
+        }
+
+        let template = self.cursor.template;
+        let screen_top = self.rows.len() - self.screen_lines;
+        for i in self.scroll_region.start..(self.scroll_region.end - n) {
+            let src = screen_top + i + n;
+            let dst = screen_top + i;
+            self.rows.swap(src, dst);
+        }
+        for i in (self.scroll_region.end - n)..self.scroll_region.end {
+            let idx = screen_top + i;
+            self.rows[idx].clear_with(&template);
+        }
+    }
+
+    /// A blank row carrying the cursor's current SGR background.
+    fn blank_row(&self) -> Row {
+        let mut row = Row::new(self.cols);
+        row.clear_with(&self.cursor.template);
+        row
     }
 
     /// Scroll the region down by `n` rows (lines move towards the bottom).
@@ -528,9 +560,11 @@ impl Grid {
         if line < self.scroll_region.start || line >= self.scroll_region.end {
             return;
         }
+        // Rotate only: deleted lines must never land in scrollback, even
+        // when the cursor is on the top line.
         let saved = self.scroll_region.clone();
         self.scroll_region.start = line;
-        self.scroll_up_region(n);
+        self.rotate_region_up(n);
         self.scroll_region = saved;
     }
 
@@ -889,6 +923,91 @@ mod tests {
         assert_eq!(g[Line(1)].cells[0].c, 'c'); // was row 2
         assert_eq!(g[Line(2)].cells[0].c, 'd'); // was row 3
         assert_eq!(g[Line(4)].cells[0].c, 'e'); // fixed
+        assert_eq!(g.history_size(), 0, "non-top region must not feed history");
+    }
+
+    /// Write `chars[i]` into column 0 of screen row `i`.
+    fn fill_rows(g: &mut Grid, chars: &str) {
+        for (l, ch) in chars.chars().enumerate() {
+            g.goto(Line(l as i32), Column(0));
+            g.input(ch, true);
+        }
+    }
+
+    fn first_char(g: &Grid, line: i32) -> char {
+        g[Line(line)].cells[0].c
+    }
+
+    #[test]
+    fn top_anchored_region_feeds_history() {
+        // Codex inline mode: region covers rows above a fixed viewport
+        // (rows 4..6 here); newlines at the region bottom push transcript
+        // lines into scrollback.
+        let mut g = Grid::new(3, 6, 100);
+        fill_rows(&mut g, "abcdef");
+        g.set_scroll_region(0, 4);
+        g.goto(Line(3), Column(0));
+        g.line_feed();
+        g.line_feed();
+
+        assert_eq!(g.history_size(), 2);
+        assert_eq!(first_char(&g, -2), 'a');
+        assert_eq!(first_char(&g, -1), 'b');
+        assert_eq!(first_char(&g, 0), 'c');
+        assert_eq!(first_char(&g, 1), 'd');
+        assert_eq!(first_char(&g, 2), ' ');
+        assert_eq!(first_char(&g, 3), ' ');
+        // Rows below the region are untouched.
+        assert_eq!(first_char(&g, 4), 'e');
+        assert_eq!(first_char(&g, 5), 'f');
+    }
+
+    #[test]
+    fn delete_lines_at_top_does_not_feed_history() {
+        let mut g = Grid::new(3, 4, 100);
+        fill_rows(&mut g, "abcd");
+        g.goto(Line(0), Column(0));
+        g.delete_lines(1);
+        assert_eq!(g.history_size(), 0);
+        assert_eq!(first_char(&g, 0), 'b');
+        assert_eq!(first_char(&g, 3), ' ');
+    }
+
+    #[test]
+    fn top_anchored_region_without_history_drops_lines() {
+        // The alt grid has no history: lines scrolled off the top vanish
+        // but the region still scrolls correctly.
+        let mut g = Grid::new(3, 4, 0);
+        fill_rows(&mut g, "abcd");
+        g.set_scroll_region(0, 3);
+        g.goto(Line(2), Column(0));
+        g.line_feed();
+        assert_eq!(g.history_size(), 0);
+        assert_eq!(first_char(&g, 0), 'b');
+        assert_eq!(first_char(&g, 1), 'c');
+        assert_eq!(first_char(&g, 2), ' ');
+        assert_eq!(first_char(&g, 3), 'd');
+    }
+
+    #[test]
+    fn scrolled_back_viewport_stays_anchored() {
+        let mut g = Grid::new(3, 2, 100);
+        g.goto(Line(1), Column(0));
+        for ch in "abcde".chars() {
+            g.carriage_return();
+            g.input(ch, true);
+            g.line_feed();
+        }
+        g.scroll_display(Scroll::Delta(2));
+        let anchored = first_char(&g, 0);
+
+        for ch in "xyz".chars() {
+            g.carriage_return();
+            g.input(ch, true);
+            g.line_feed();
+        }
+        assert_eq!(first_char(&g, 0), anchored);
+        assert_eq!(g.display_offset(), 5);
     }
 
     #[test]
