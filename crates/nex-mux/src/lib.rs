@@ -51,6 +51,19 @@ pub struct Tab {
     pub zoomed_pane: Option<PaneId>,
 }
 
+impl Tab {
+    /// Panes currently on screen: only the zoomed pane while zoomed,
+    /// otherwise every pane in the layout. Hidden panes keep their split
+    /// bounds, so anything that targets panes by position or order (clicks,
+    /// focus cycling) must go through this.
+    pub fn visible_pane_ids(&self) -> Vec<PaneId> {
+        match self.zoomed_pane {
+            Some(zoomed) => vec![zoomed],
+            None => self.layout.pane_ids(),
+        }
+    }
+}
+
 /// Top-level multiplexer state.
 pub struct Mux {
     panes: HashMap<PaneId, Pane>,
@@ -242,26 +255,26 @@ impl Mux {
             return; // caller should exit
         }
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
-        self.focused_pane = self.tabs[self.active_tab].layout.pane_ids()[0];
-        // Mark all panes in the now-active tab as dirty so their text buffers
-        // get reshaped on the next render. Without this, a tab that slides in
-        // after the closed one renders only background cells.
-        for pane_id in self.tabs[self.active_tab].layout.pane_ids() {
-            if let Some(pane) = self.panes.get(&pane_id) {
-                pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
+        self.enter_active_tab();
     }
 
     pub fn switch_tab(&mut self, index: usize) {
         if index < self.tabs.len() {
             self.active_tab = index;
-            self.focused_pane = self.tabs[self.active_tab].layout.pane_ids()[0];
-            // Mark all panes in the new tab as dirty so they get reshaped
-            for pane_id in self.tabs[self.active_tab].layout.pane_ids() {
-                if let Some(pane) = self.panes.get(&pane_id) {
-                    pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+            self.enter_active_tab();
+        }
+    }
+
+    /// Focus the active tab's first *visible* pane — a zoom survives tab
+    /// switches, so the layout's first pane may be hidden — and mark all its
+    /// panes dirty so their text reshapes on the next render (otherwise a tab
+    /// that becomes active renders only background cells).
+    fn enter_active_tab(&mut self) {
+        let tab = &self.tabs[self.active_tab];
+        self.focused_pane = tab.visible_pane_ids()[0];
+        for pane_id in tab.layout.pane_ids() {
+            if let Some(pane) = self.panes.get(&pane_id) {
+                pane.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -353,18 +366,18 @@ impl Mux {
     }
 
     pub fn focus_pane_at_pixel(&mut self, px: f32, py: f32) -> Option<PaneId> {
-        let active_ids = self.tabs[self.active_tab].layout.pane_ids();
-        let pane_id = active_ids.into_iter()
-            .filter_map(|id| self.panes.get(&id))
+        let pane_id = self.panes_in_active_tab()
+            .into_iter()
             .find(|p| p.bounds.contains(px, py))
             .map(|p| p.id)?;
         self.focused_pane = pane_id;
         Some(pane_id)
     }
 
+    /// Move focus to the next/previous visible pane. While a pane is zoomed
+    /// it is the only visible one, so focus stays put.
     pub fn cycle_focus(&mut self, forward: bool) {
-        let tab = &self.tabs[self.active_tab];
-        let ids = tab.layout.pane_ids();
+        let ids = self.tabs[self.active_tab].visible_pane_ids();
         if ids.len() <= 1 {
             return;
         }
@@ -435,13 +448,10 @@ impl Mux {
         self.panes.get(&self.focused_pane).map(|p| Arc::clone(&p.pty_writer))
     }
 
+    /// Panes visible in the active tab (see `Tab::visible_pane_ids`).
     pub fn panes_in_active_tab(&self) -> Vec<&Pane> {
-        if let Some(zoomed_id) = self.tabs[self.active_tab].zoomed_pane {
-            return self.panes.get(&zoomed_id).into_iter().collect();
-        }
-        let tab = &self.tabs[self.active_tab];
-        tab.layout
-            .pane_ids()
+        self.tabs[self.active_tab]
+            .visible_pane_ids()
             .into_iter()
             .filter_map(|id| self.panes.get(&id))
             .collect()
@@ -475,4 +485,39 @@ pub trait MuxEventProxy: Send + Sync + Clone {
     fn send_reset_title(&self, pane_id: PaneId);
     fn send_bell(&self, pane_id: PaneId);
     fn send_redraw(&self);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn split_tab(first: PaneId, second: PaneId) -> Tab {
+        Tab {
+            id: TabId::new(),
+            title: DEFAULT_TAB_TITLE.to_string(),
+            layout: LayoutNode::Split {
+                direction: SplitDirection::Vertical,
+                ratio: 0.5,
+                first: Box::new(LayoutNode::Leaf { pane_id: first }),
+                second: Box::new(LayoutNode::Leaf { pane_id: second }),
+            },
+            zoomed_pane: None,
+        }
+    }
+
+    #[test]
+    fn all_split_panes_are_visible_when_not_zoomed() {
+        let (left, right) = (PaneId::new(), PaneId::new());
+        assert_eq!(split_tab(left, right).visible_pane_ids(), [left, right]);
+    }
+
+    #[test]
+    fn only_the_zoomed_pane_is_visible() {
+        // Clicks and focus cycling go through this, so a click where a hidden
+        // pane used to be can't focus it.
+        let (left, right) = (PaneId::new(), PaneId::new());
+        let mut tab = split_tab(left, right);
+        tab.zoomed_pane = Some(right);
+        assert_eq!(tab.visible_pane_ids(), [right]);
+    }
 }
