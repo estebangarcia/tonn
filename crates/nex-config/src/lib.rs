@@ -39,6 +39,21 @@ impl TonnConfig {
     }
 }
 
+/// Mouse-wheel scroll speed relative to the platform's native feel.
+pub const DEFAULT_SCROLL_SPEED: f64 = 1.0;
+pub const MIN_SCROLL_SPEED: f64 = 0.1;
+pub const MAX_SCROLL_SPEED: f64 = 10.0;
+
+/// Clamp a scroll speed into the supported range; non-finite values (a
+/// hand-edited config) fall back to the default.
+pub fn clamp_scroll_speed(speed: f64) -> f64 {
+    if speed.is_finite() {
+        speed.clamp(MIN_SCROLL_SPEED, MAX_SCROLL_SPEED)
+    } else {
+        DEFAULT_SCROLL_SPEED
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeneralConfig {
@@ -47,7 +62,16 @@ pub struct GeneralConfig {
     pub font_size: f32,
     pub theme: String,
     pub scrollback_history: usize,
+    /// Mouse-wheel scroll speed multiplier. 1.0 = native platform feel.
+    pub scroll_speed: f64,
     pub auto_update: bool,
+}
+
+impl GeneralConfig {
+    /// `scroll_speed`, clamped to the supported range.
+    pub fn clamped_scroll_speed(&self) -> f64 {
+        clamp_scroll_speed(self.scroll_speed)
+    }
 }
 
 impl Default for GeneralConfig {
@@ -58,6 +82,7 @@ impl Default for GeneralConfig {
             font_size: 14.0,
             theme: "dark".to_string(),
             scrollback_history: 10_000,
+            scroll_speed: DEFAULT_SCROLL_SPEED,
             auto_update: true,
         }
     }
@@ -538,4 +563,24 @@ pub fn load_config() -> TonnConfig {
         }
     }
     TonnConfig::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scroll_speed_is_clamped_and_sanitised() {
+        assert_eq!(clamp_scroll_speed(1.5), 1.5);
+        assert_eq!(clamp_scroll_speed(0.0), MIN_SCROLL_SPEED);
+        assert_eq!(clamp_scroll_speed(-2.0), MIN_SCROLL_SPEED);
+        assert_eq!(clamp_scroll_speed(100.0), MAX_SCROLL_SPEED);
+        assert_eq!(clamp_scroll_speed(f64::NAN), DEFAULT_SCROLL_SPEED);
+    }
+
+    #[test]
+    fn missing_scroll_speed_uses_default() {
+        let config: TonnConfig = toml::from_str("[general]\nfont_size = 13.0\n").unwrap();
+        assert_eq!(config.general.scroll_speed, DEFAULT_SCROLL_SPEED);
+    }
 }

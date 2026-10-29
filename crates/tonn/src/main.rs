@@ -24,8 +24,21 @@ const TAB_BAR_HEIGHT_LOGICAL: f32 = 28.0;
 const BELL_FLASH_DURATION_MS: u64 = 150;
 const DEFAULT_WINDOW_WIDTH: u32 = 960;
 const DEFAULT_WINDOW_HEIGHT: u32 = 640;
+/// Lines per wheel notch where the OS reports raw, unaccelerated notches
+/// (Windows / X11 / Wayland) — the common "3 lines per notch" convention.
 const SCROLL_LINE_MULTIPLIER: f64 = 3.0;
 const SCROLL_PIXEL_DIVISOR: f64 = 20.0;
+/// A single wheel notch always scrolls at least this many lines.
+const MIN_LINES_PER_DETENT: f64 = 1.0;
+/// Whether each `LineDelta` event is exactly one physical wheel notch,
+/// already scaled by the OS scroll acceleration. On macOS winit reports
+/// `LineDelta` only for non-precise (notched) wheels — one event per notch —
+/// with the system acceleration applied: a slow notch arrives as ~0.1 lines,
+/// a fast spin as several. Those values are used as-is (no multiplier, which
+/// would compound the acceleration). Elsewhere, fractional `LineDelta`s are
+/// sub-notch steps from hi-res wheels (Windows `WHEEL_DELTA` fractions) or
+/// smooth scrolling (X11/Wayland) and must accumulate.
+const LINE_DELTA_IS_DETENT: bool = cfg!(target_os = "macos");
 const RESIZE_DEBOUNCE_MS: u64 = 50;
 const DIVIDER_RENDER_THICKNESS: f32 = 4.0;
 const EXECUTE_STDOUT_MAX_CHARS: usize = 4000;
@@ -365,6 +378,7 @@ fn build_settings_fields(font_families: Vec<String>) -> Vec<SettingItem> {
         SettingItem { section: "General".to_string(), label: "Theme".to_string(), key: "general.theme".to_string(), field_type: SettingsFieldType::Select(nex_config::AVAILABLE_THEMES.iter().map(|s| s.to_string()).collect()) },
         SettingItem { section: "General".to_string(), label: "Auto Update".to_string(), key: "general.auto_update".to_string(), field_type: SettingsFieldType::Toggle },
         SettingItem { section: "Terminal".to_string(), label: "Scrollback".to_string(), key: "general.scrollback_history".to_string(), field_type: SettingsFieldType::Number },
+        SettingItem { section: "Terminal".to_string(), label: "Scroll Speed".to_string(), key: "general.scroll_speed".to_string(), field_type: SettingsFieldType::Number },
         SettingItem { section: "MCP Server".to_string(), label: "Enabled".to_string(), key: "mcp.enabled".to_string(), field_type: SettingsFieldType::Toggle },
     ]
 }
@@ -396,6 +410,7 @@ impl SettingsPanel {
             "general.theme" => self.config.general.theme.clone(),
             "general.auto_update" => if self.config.general.auto_update { "On" } else { "Off" }.to_string(),
             "general.scrollback_history" => self.config.general.scrollback_history.to_string(),
+            "general.scroll_speed" => self.config.general.scroll_speed.to_string(),
             "mcp.enabled" => if self.config.mcp.enabled { "On" } else { "Off" }.to_string(),
             _ => String::new(),
         }
@@ -415,6 +430,7 @@ impl SettingsPanel {
             "general.theme" => self.config.general.theme = value.to_string(),
             "general.auto_update" => self.config.general.auto_update = value == "On",
             "general.scrollback_history" => if let Ok(v) = value.parse() { self.config.general.scrollback_history = v; },
+            "general.scroll_speed" => if let Ok(v) = value.parse() { self.config.general.scroll_speed = nex_config::clamp_scroll_speed(v); },
             "mcp.enabled" => self.config.mcp.enabled = value == "On",
             _ => {}
         }
@@ -444,8 +460,8 @@ struct App {
     modifiers: Modifiers,
     mouse_pos: (f64, f64),
     mouse_selecting: bool,
-    /// Fractional wheel lines carried over between trackpad events.
-    scroll_accumulator: f64,
+    /// Converts wheel deltas into whole lines.
+    wheel: WheelAccumulator,
     /// Reported press whose drag/release is still owed to its pane.
     mouse_grab: Option<MouseGrab>,
     /// Cell of the last motion report, so motion is reported once per cell.
@@ -479,7 +495,7 @@ impl App {
             modifiers: Modifiers::default(),
             mouse_pos: (0.0, 0.0),
             mouse_selecting: false,
-            scroll_accumulator: 0.0,
+            wheel: WheelAccumulator::default(),
             mouse_grab: None,
             last_mouse_cell: None,
             focus_reported: None,
@@ -579,19 +595,6 @@ impl App {
         let (col, row) = self.pointer_cell(pane)?;
         let event = MouseEvent { button, kind, col, row, mods: self.key_modifiers() };
         mouse::encode(&event, mode)
-    }
-
-    /// Convert a wheel delta into whole lines (positive = towards history),
-    /// carrying fractional movement over to the next event so slow trackpad
-    /// scrolls aren't rounded up to a line per event.
-    fn wheel_lines(&mut self, delta: MouseScrollDelta) -> i32 {
-        self.scroll_accumulator += match delta {
-            MouseScrollDelta::LineDelta(_, y) => f64::from(y) * SCROLL_LINE_MULTIPLIER,
-            MouseScrollDelta::PixelDelta(pos) => pos.y / SCROLL_PIXEL_DIVISOR,
-        };
-        let lines = self.scroll_accumulator.trunc();
-        self.scroll_accumulator -= lines;
-        lines as i32
     }
 
     /// Route wheel lines to the focused pane's app (mouse reports or
@@ -744,6 +747,54 @@ fn write_to_pane(pane: &Pane, data: &[u8]) {
     let mut writer = pane.pty_writer.lock();
     let _ = writer.write_all(data);
     let _ = writer.flush();
+}
+
+/// Converts winit wheel deltas into whole lines to scroll (positive =
+/// towards history). `speed` is the user's scroll speed, relative to the
+/// platform's native feel (1.0).
+#[derive(Debug, Default)]
+struct WheelAccumulator {
+    /// Fractional lines carried over to the next event.
+    carry: f64,
+}
+
+impl WheelAccumulator {
+    fn lines(&mut self, delta: MouseScrollDelta, speed: f64) -> i32 {
+        match delta {
+            MouseScrollDelta::LineDelta(_, y) if LINE_DELTA_IS_DETENT => self.detent(y, speed),
+            MouseScrollDelta::LineDelta(_, y) => self.accumulate(f64::from(y) * SCROLL_LINE_MULTIPLIER * speed),
+            MouseScrollDelta::PixelDelta(pos) => self.accumulate(pos.y / SCROLL_PIXEL_DIVISOR * speed),
+        }
+    }
+
+    /// One already-accelerated wheel notch. The notch is raised to at least
+    /// `MIN_LINES_PER_DETENT` *before* `speed` applies, so the speed scales
+    /// slow notches too (2× → two lines per slow notch). Fractions carry over
+    /// between notches, and no notch ever moves less than the minimum — even
+    /// below 1×, since a notch that doesn't scroll is the bug this fixes.
+    fn detent(&mut self, y: f32, speed: f64) -> i32 {
+        if y == 0.0 {
+            return 0;
+        }
+        let y = f64::from(y);
+        let notch = y.abs().max(MIN_LINES_PER_DETENT).copysign(y);
+        let lines = self.accumulate(notch * speed);
+        if f64::from(lines.unsigned_abs()) < MIN_LINES_PER_DETENT {
+            // Over-delivering to honour the minimum: drop the carry.
+            self.carry = 0.0;
+            return MIN_LINES_PER_DETENT.copysign(y) as i32;
+        }
+        lines
+    }
+
+    /// Add fractional lines and return the whole lines now available, so slow
+    /// trackpad / hi-res wheel movement isn't rounded up to a line per event.
+    fn accumulate(&mut self, lines: f64) -> i32 {
+        self.carry += lines;
+        let whole = self.carry.trunc();
+        self.carry -= whole;
+        whole as i32
+    }
 }
 
 /// A mouse press that was reported to an application. Like an X11 pointer
@@ -1123,7 +1174,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                let lines = self.wheel_lines(delta);
+                let lines = self.wheel.lines(delta, self.config.general.clamped_scroll_speed());
+                tracing::debug!(?delta, lines, "mouse wheel");
                 if lines != 0 {
                     self.handle_wheel(lines);
                 }
@@ -2308,6 +2360,87 @@ mod tests {
 
     fn grab(pane: PaneId, button: TermMouseButton) -> Option<MouseGrab> {
         Some(MouseGrab { pane, button })
+    }
+
+    const SLOW_NOTCH: f32 = 0.1;
+    const NATIVE: f64 = nex_config::DEFAULT_SCROLL_SPEED;
+
+    /// Lines scrolled by each of `notches` identical wheel notches.
+    fn notch_lines(y: f32, speed: f64, notches: usize) -> Vec<i32> {
+        let mut wheel = WheelAccumulator::default();
+        (0..notches).map(|_| wheel.detent(y, speed)).collect()
+    }
+
+    #[test]
+    fn slow_wheel_notch_scrolls_one_line_at_native_speed() {
+        assert_eq!(notch_lines(SLOW_NOTCH, NATIVE, 3), [1, 1, 1]);
+        assert_eq!(notch_lines(-SLOW_NOTCH, NATIVE, 3), [-1, -1, -1]);
+        assert_eq!(notch_lines(0.0, NATIVE, 1), [0]);
+    }
+
+    #[test]
+    fn speed_scales_slow_notches() {
+        assert_eq!(notch_lines(SLOW_NOTCH, 2.0, 3), [2, 2, 2]);
+        assert_eq!(notch_lines(SLOW_NOTCH, nex_config::MAX_SCROLL_SPEED, 2), [10, 10]);
+        // Fractional speeds carry over between notches: 1.5× → 1, 2, 1, 2.
+        assert_eq!(notch_lines(SLOW_NOTCH, 1.5, 4), [1, 2, 1, 2]);
+    }
+
+    #[test]
+    fn slower_speed_never_drops_a_notch() {
+        // Below 1× every slow notch still moves a line…
+        assert_eq!(notch_lines(SLOW_NOTCH, 0.5, 3), [1, 1, 1]);
+        assert_eq!(notch_lines(SLOW_NOTCH, nex_config::MIN_SCROLL_SPEED, 3), [1, 1, 1]);
+        // …while fast (OS-accelerated) notches are scaled down.
+        assert_eq!(notch_lines(4.0, 0.5, 2), [2, 2]);
+    }
+
+    #[test]
+    fn fast_wheel_notch_uses_os_acceleration() {
+        // The OS already accelerated the delta: native speed uses it as-is.
+        assert_eq!(notch_lines(3.0, NATIVE, 1), [3]);
+        assert_eq!(notch_lines(-3.0, NATIVE, 1), [-3]);
+        assert_eq!(notch_lines(3.0, 2.0, 1), [6]);
+    }
+
+    #[test]
+    fn reversing_direction_moves_immediately() {
+        let mut wheel = WheelAccumulator::default();
+        assert_eq!(wheel.detent(SLOW_NOTCH, 1.5), 1); // carries +0.5
+        assert_eq!(wheel.detent(-SLOW_NOTCH, 1.5), -1);
+    }
+
+    #[test]
+    fn trackpad_pixels_accumulate_into_lines() {
+        let half_line = MouseScrollDelta::PixelDelta(
+            winit::dpi::PhysicalPosition::new(0.0, SCROLL_PIXEL_DIVISOR / 2.0),
+        );
+        let mut wheel = WheelAccumulator::default();
+        assert_eq!(wheel.lines(half_line, NATIVE), 0);
+        assert_eq!(wheel.lines(half_line, NATIVE), 1);
+
+        let mut doubled = WheelAccumulator::default();
+        assert_eq!(doubled.lines(half_line, 2.0), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_macos_wheel_notch_scrolls() {
+        let mut wheel = WheelAccumulator::default();
+        let notch = MouseScrollDelta::LineDelta(0.0, SLOW_NOTCH);
+        for _ in 0..3 {
+            assert_eq!(wheel.lines(notch, NATIVE), 1);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn hires_wheel_steps_accumulate() {
+        // Eight 1/8-notch steps from a hi-res wheel = one notch = 3 lines.
+        let mut wheel = WheelAccumulator::default();
+        let step = MouseScrollDelta::LineDelta(0.0, 0.125);
+        let total: i32 = (0..8).map(|_| wheel.lines(step, NATIVE)).sum();
+        assert_eq!(total, 3);
     }
 
     #[test]
