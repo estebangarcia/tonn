@@ -2,6 +2,7 @@
 
 pub mod keys;
 pub mod mouse;
+pub mod paste;
 
 pub mod ansi;
 pub mod cell;

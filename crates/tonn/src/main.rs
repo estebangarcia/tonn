@@ -1401,9 +1401,8 @@ impl App {
         {
             if let Ok(mut clipboard) = arboard::Clipboard::new()
                 && let Ok(text) = clipboard.get_text() {
-                    self.write_to_focused(b"\x1b[200~");
-                    self.write_to_focused(text.as_bytes());
-                    self.write_to_focused(b"\x1b[201~");
+                    let mode = self.focused_mode().unwrap_or_default();
+                    self.write_to_focused(&nex_terminal::paste::encode(&text, mode));
                 }
             return;
         }

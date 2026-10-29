@@ -696,6 +696,16 @@ mod tests {
     }
 
     #[test]
+    fn paste_at_password_prompt_has_no_bracket_markers() {
+        // The shell enables bracketed paste while editing the command line
+        // and disables it before running the command — so a password prompt
+        // (docker login, psql) must receive the bare text.
+        let mut t = term(20, 3);
+        feed(&mut t, b"\x1b[?2004h$ docker login\r\n\x1b[?2004lPassword: ");
+        assert_eq!(crate::paste::encode("s3cret", t.mode()), b"s3cret");
+    }
+
+    #[test]
     fn alternate_scroll_mode_toggles() {
         let mut t = term(20, 3);
         assert!(t.mode().contains(TermMode::ALTERNATE_SCROLL), "on by default");
