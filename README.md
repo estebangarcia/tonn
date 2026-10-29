@@ -60,11 +60,23 @@ The AI doesn't get raw terminal noise. Tonn classifies every command output (git
 | Cmd+Shift+Enter | Toggle pane zoom |
 | Cmd+]/[ | Cycle pane focus |
 | Cmd+1-9 | Switch to tab |
-| Ctrl+Tab | Tab switcher |
+| Ctrl+Tab / Ctrl+Shift+Tab | Tab switcher (next / previous) |
 | Cmd+C/V | Copy/paste |
+| Cmd+F | Search the focused pane |
 | Cmd+=/-/0 | Font zoom |
 | Cmd+Shift+P | AI session browser |
 | Cmd+, | Settings |
+
+While searching:
+
+| Shortcut | Action |
+|---|---|
+| Enter, Cmd+G or F3 | Next match (up, into older output) |
+| Shift+Enter, Cmd+Shift+G or Shift+F3 | Previous match (down, into newer output) |
+| Cmd+V | Paste into the search |
+| Esc | Close search |
+
+**Linux and Windows**: Cmd is the Super/Windows key, except copy/paste (Ctrl+Shift+C/V), search (Ctrl+Shift+F) and font zoom (Ctrl+=/-/0).
 
 ## Building from source
 
